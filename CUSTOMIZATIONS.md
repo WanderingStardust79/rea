@@ -9,6 +9,9 @@ Personal fork of [morluto/rea](https://github.com/morluto/rea), tracking upstrea
 _Add entries as you go: date, file, what and why._
 
 - _2026-10-12_ — `CUSTOMIZATIONS.md`, `.github/workflows/sync-upstream.yml` — adoption files. All inherited upstream workflows disabled on the fork.
+- _2026-10-12_ — `turbo.json` — `"agentGuidance": false` so turbo stops rewriting the managed block in `AGENTS.md` when it detects an agent (vetting condition).
+- _2026-10-12_ — no change needed for Frida: `rea-agents-6.4.0` has no `frida` dependency (it landed on upstream `main` later). Recheck when merging the next tag. 6.4.0 lockfile audited separately: 0 advisories, all registry with integrity, install scripts only esbuild (dev) and fsevents (macOS only).
+- _2026-10-12_ — built in WSL Ubuntu (aarch64) at `/home/paperclip/rea`; registered for Claude Code at project scope in `C:/Users/mattb/re-lab/.mcp.json`.
 
 ## Syncing upstream
 
