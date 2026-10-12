@@ -1,0 +1,41 @@
+name: Sync upstream
+on:
+  schedule:
+    - cron: '0 9 * * 1'  # Monday 09:00 UTC
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      HAS_SYNC_TOKEN: ${{ secrets.SYNC_TOKEN != '' }}
+    steps:
+      # GITHUB_TOKEN cannot push commits that touch .github/workflows, and upstream
+      # changes them often. Set repo secret SYNC_TOKEN (fine grained PAT, this repo only,
+      # Contents + Workflows read/write) so those syncs land.
+      - name: Warn if SYNC_TOKEN is missing
+        if: env.HAS_SYNC_TOKEN != 'true'
+        run: echo "::warning::SYNC_TOKEN not set; pushes that change workflow files will be rejected"
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+      - name: Configure git
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+      - name: Add upstream and fetch
+        run: |
+          git remote add upstream https://github.com/morluto/rea.git
+          git fetch upstream
+      - name: Fast-forward main from upstream
+        run: |
+          if git merge-base --is-ancestor HEAD upstream/main; then
+            git merge --ff-only upstream/main
+            git push origin main
+          else
+            echo "::warning::main has diverged from upstream/main — sync manually on mattb/main"
+            exit 0
+          fi
