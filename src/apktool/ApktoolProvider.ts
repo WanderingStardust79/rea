@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { createWriteStream, constants as fsConstants } from "node:fs";
+import { createWriteStream } from "node:fs";
 import {
   access,
   chmod,
@@ -20,11 +20,15 @@ import type {
   ExecutionOptions,
   ProviderAvailability,
 } from "../application/AnalysisProvider.js";
+import { providerConfigurationRefusal } from "../domain/providerConfigurationRefusal.js";
 import {
   createAnalysisExecution,
   type AnalysisExecution,
 } from "../application/AnalysisProvider.js";
-import type { ApktoolRequest } from "../domain/apktool/apktoolResourceAnalysis.js";
+import {
+  androidLocaleQualifierSchema,
+  type ApktoolRequest,
+} from "../domain/apktool/apktoolResourceAnalysis.js";
 import {
   AnalysisCapabilityUnavailableError,
   AnalysisCancelledError,
@@ -48,9 +52,12 @@ import {
 } from "../process/OwnedCommand.js";
 import type { ProviderProcessSupervisor } from "../process/ProviderProcess.js";
 import { snapshotEnvironment } from "../process/snapshotEnvironment.js";
+import { WindowsBatchCommandError } from "../process/WindowsBatchCommand.js";
 import {
+  APKTOOL_COMMAND_ENV,
   ApktoolConfigurationFailure,
   apktoolConfigurationAvailability,
+  apktoolInvocation,
   inspectApktoolClient,
   resolveApktoolCommand,
   type ApktoolCommandSelection,
@@ -114,13 +121,20 @@ const readBoundedText = async (
     throwIfCancelled(operation, signal);
     const truncated = length > budget;
     // A prefix may end within a UTF-8 character; omit those trailing bytes.
-    const decoder = new TextDecoder("utf-8");
-    return {
-      text: decoder.decode(bytes.subarray(0, Math.min(length, budget)), {
-        stream: truncated,
-      }),
-      truncated,
-    };
+    try {
+      const decoder = new TextDecoder("utf-8", { fatal: true });
+      return {
+        text: decoder.decode(bytes.subarray(0, Math.min(length, budget)), {
+          stream: truncated,
+        }),
+        truncated,
+      };
+    } catch (cause: unknown) {
+      throw new AnalysisProtocolError(
+        `apktool produced invalid UTF-8 in ${path}`,
+        { cause },
+      );
+    }
   } finally {
     await file.close();
   }
@@ -136,7 +150,7 @@ interface DecodeLimits {
 
 const runApktool = async (
   operation: string,
-  command: string,
+  selection: ApktoolCommandSelection,
   arguments_: readonly string[],
   limits: DecodeLimits,
   signal: AbortSignal | undefined,
@@ -145,13 +159,29 @@ const runApktool = async (
 ): Promise<Result<{ stdout: string; stderr: string }, AnalysisError>> => {
   if (signal?.aborted === true)
     return err(new AnalysisCancelledError(operation));
+  let invocation: ReturnType<typeof apktoolInvocation>;
+  try {
+    invocation = apktoolInvocation(selection, arguments_, environment);
+  } catch (cause) {
+    if (!(cause instanceof WindowsBatchCommandError)) throw cause;
+    const reason = `The apktool batch launcher cannot receive REA's decode paths through cmd.exe: ${cause.message}`;
+    return err(
+      new AnalysisCapabilityUnavailableError(
+        APKTOOL_PROVIDER_IDENTITY.id,
+        operation,
+        reason,
+        { cause, userMessage: reason },
+      ),
+    );
+  }
   try {
     const output = await runOwnedCommand(
       {
-        command,
-        arguments: arguments_,
+        command: invocation.command,
+        arguments: invocation.arguments,
+        windowsVerbatimArguments: invocation.windowsVerbatimArguments,
         runId: randomUUID(),
-        hostEnvironment: { ...process.env, ...environment },
+        hostEnvironment: environment,
       },
       {
         timeoutMs: limits.timeoutMs,
@@ -219,7 +249,7 @@ const runApktool = async (
     return err(
       new AnalysisUnsupportedTargetError(
         operation,
-        command,
+        selection.command,
         output?.stderr.text.trim().slice(0, STDERR_EXCERPT_BYTES) ||
           `apktool exited with code ${String(output?.exitCode ?? "unknown")} for ${operation}`,
         {
@@ -264,6 +294,7 @@ const countDecodedFiles = async (
           const match = /^values-(.+)$/u.exec(entry.name);
           if (
             match !== null &&
+            androidLocaleQualifierSchema.safeParse(match[1]).success &&
             (await access(join(path, "strings.xml")).then(
               () => true,
               () => false,
@@ -290,7 +321,9 @@ export interface ApktoolProviderOptions {
  * (`--no-src`) because Java-source recovery belongs to the JADX family.
  */
 export class ApktoolProvider {
-  private readonly environment: Readonly<Record<string, string | undefined>>;
+  private readonly selectedEnvironment:
+    | Readonly<Record<string, string | undefined>>
+    | undefined;
 
   private readonly workspaces = new Set<string>();
   private readonly removeWorkspace: (path: string) => Promise<void>;
@@ -301,14 +334,25 @@ export class ApktoolProvider {
   #closePromise: Promise<void> | undefined;
 
   constructor(options: ApktoolProviderOptions = {}) {
-    this.environment = snapshotEnvironment(options.environment ?? process.env);
+    this.selectedEnvironment =
+      options.environment === undefined
+        ? undefined
+        : snapshotEnvironment(options.environment);
     this.removeWorkspace =
       options.removeWorkspace ??
       ((path) => rm(path, { recursive: true, force: true }));
   }
 
-  private selection(): ApktoolCommandSelection {
-    return resolveApktoolCommand(this.environment);
+  private operationEnvironment(): Readonly<NodeJS.ProcessEnv> {
+    const ambient = snapshotEnvironment(process.env);
+    if (this.selectedEnvironment === undefined) return ambient;
+    // Child inheritance is sampled per operation. An explicit map keeps its
+    // launcher choice authoritative, including an omitted command selecting PATH.
+    return snapshotEnvironment({
+      ...ambient,
+      ...this.selectedEnvironment,
+      [APKTOOL_COMMAND_ENV]: this.selectedEnvironment[APKTOOL_COMMAND_ENV],
+    });
   }
 
   /** Probe the selected apktool launcher; decodes nothing. */
@@ -327,9 +371,14 @@ export class ApktoolProvider {
   async #inspectAvailability(
     signal: AbortSignal,
   ): Promise<ProviderAvailability> {
-    const selection = this.selection();
+    const environment = this.operationEnvironment();
     try {
-      await inspectApktoolClient(selection, signal, this.environment);
+      const selection = await resolveApktoolCommand(
+        environment,
+        process.platform,
+        signal,
+      );
+      await inspectApktoolClient(selection, signal, environment);
       throwIfCancelled("inspect_apktool_client", signal);
       return {
         status: "available",
@@ -379,27 +428,31 @@ export class ApktoolProvider {
   ): Promise<Result<AnalysisExecution, AnalysisError>> {
     if (signal?.aborted === true)
       return err(new AnalysisCancelledError(request.operation));
-    const selection = this.selection();
+    const environment = this.operationEnvironment();
+    let selection: ApktoolCommandSelection;
     let identity: ApktoolClientIdentity;
     try {
-      identity = await inspectApktoolClient(
-        selection,
+      selection = await resolveApktoolCommand(
+        environment,
+        process.platform,
         signal,
-        this.environment,
       );
+      identity = await inspectApktoolClient(selection, signal, environment);
     } catch (cause) {
-      if (cause instanceof AnalysisCancelledError) return err(cause);
-      if (cause instanceof ApktoolConfigurationFailure)
+      if (
+        cause instanceof AnalysisCancelledError ||
+        cause instanceof AnalysisTimeoutError
+      )
+        return err(cause);
+      if (cause instanceof ApktoolConfigurationFailure) {
         return err(
-          new AnalysisCapabilityUnavailableError(
+          providerConfigurationRefusal(
             APKTOOL_PROVIDER_IDENTITY.id,
             request.operation,
-            typeof cause.diagnostics.remediation === "string"
-              ? `${cause.message} ${cause.diagnostics.remediation}`
-              : cause.message,
-            { cause },
+            cause,
           ),
         );
+      }
       return err(
         new AnalysisProtocolError(
           `apktool version probe failed for ${request.operation}`,
@@ -423,6 +476,7 @@ export class ApktoolProvider {
     return this.decodeResources(
       request.operation,
       selection,
+      environment,
       client,
       provider,
       request.input,
@@ -474,6 +528,7 @@ export class ApktoolProvider {
   private async decodeResources(
     operation: "decode_android_resources",
     selection: ApktoolCommandSelection,
+    environment: Readonly<NodeJS.ProcessEnv>,
     client: {
       command: string;
       command_source: string;
@@ -586,7 +641,7 @@ export class ApktoolProvider {
       await mkdir(framework);
       const decoded = await runApktool(
         operation,
-        selection.command,
+        selection,
         [
           "d",
           "--no-src",
@@ -602,7 +657,7 @@ export class ApktoolProvider {
           maxOutputBytes: DECODE_MAX_OUTPUT_BYTES,
         },
         signal,
-        this.environment,
+        environment,
         (owner) => this.#pendingCommandOwners.set(owner, root),
       );
       if (!decoded.ok) {
@@ -630,7 +685,9 @@ export class ApktoolProvider {
       );
       const manifest = manifestRead.text;
       const packageName =
-        manifest === null ? null : parseManifestPackage(manifest);
+        manifest === null || manifestRead.truncated
+          ? null
+          : parseManifestPackage(manifest);
       const stringsDirectory =
         input.locale === undefined
           ? "values"
@@ -698,7 +755,7 @@ export class ApktoolProvider {
                 : []),
               ...(parsedStrings.unparsedCount > 0
                 ? [
-                    `${String(parsedStrings.unparsedCount)} string entries with nested markup were not projected`,
+                    `String entries omitted due to malformed XML or unsupported markup: ${String(parsedStrings.unparsedCount)}`,
                   ]
                 : []),
               ...(parsedStrings.entries.length > MAX_STRINGS

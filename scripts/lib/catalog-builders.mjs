@@ -19,6 +19,11 @@ export const toolFamilyCatalog = (sources) => {
       contracts: [
         ...sources.nativeContracts.NATIVE_TOOL_CONTRACTS,
         ...sources.binaryDiagnosticsContracts.BINARY_DIAGNOSTICS_TOOL_CONTRACTS,
+        ...sources.cutterContracts.CUTTER_TOOL_CONTRACTS,
+        ...sources.reverseEngineeringContracts
+          .REVERSE_ENGINEERING_TOOL_CONTRACTS,
+        ...sources.gdbContracts.GDB_TOOL_CONTRACTS,
+        ...sources.rizinDebugContracts.RIZIN_DEBUG_TOOL_CONTRACTS,
       ],
     },
     {
@@ -27,6 +32,12 @@ export const toolFamilyCatalog = (sources) => {
       contracts: [
         ...sources.artifactContracts.ARTIFACT_TOOL_CONTRACTS,
         ...sources.evmContracts.EVM_TOOL_CONTRACTS,
+        ...sources.goContracts.GO_TOOL_CONTRACTS,
+        ...sources.rustContracts.RUST_TOOL_CONTRACTS,
+        ...sources.wasmContracts.WASM_TOOL_CONTRACTS,
+        ...sources.sqliteContracts.SQLITE_TOOL_CONTRACTS,
+        ...sources.captureContracts.CAPTURE_TOOL_CONTRACTS,
+        ...sources.signalContracts.SIGNAL_TOOL_CONTRACTS,
       ],
     },
     {
@@ -46,6 +57,21 @@ export const toolFamilyCatalog = (sources) => {
       id: "android",
       surface: "android-provider",
       contracts: sources.androidContracts.ANDROID_TOOL_CONTRACTS,
+    },
+    {
+      id: "pcap",
+      surface: "pcap-provider",
+      contracts: sources.pcapContracts.PCAP_TOOL_CONTRACTS,
+    },
+    {
+      id: "flutter",
+      surface: "flutter-provider",
+      contracts: sources.flutterContracts.FLUTTER_TOOL_CONTRACTS,
+    },
+    {
+      id: "frida",
+      surface: "instrumentation-provider",
+      contracts: sources.fridaContracts.FRIDA_TOOL_CONTRACTS,
     },
     {
       id: "apktool",
@@ -141,8 +167,39 @@ export const providerCatalog = (sources) => {
     reconciliationContracts,
     observationContracts,
     activeContracts,
+    fuseContracts,
   } = electronContractSlices(sources);
   return [
+    {
+      identity: sources.cutterProvider.CUTTER_PROVIDER_IDENTITY,
+      contracts: sources.cutterContracts.CUTTER_TOOL_CONTRACTS,
+    },
+    {
+      identity: sources.objdumpProvider.OBJDUMP_PROVIDER_IDENTITY,
+      contracts:
+        sources.reverseEngineeringContracts.REVERSE_ENGINEERING_TOOL_CONTRACTS.filter(
+          ({ name }) => name === "inspect_with_objdump",
+        ),
+    },
+    {
+      identity: sources.rizinProvider.RIZIN_PROVIDER_IDENTITY,
+      contracts:
+        sources.reverseEngineeringContracts.REVERSE_ENGINEERING_TOOL_CONTRACTS.filter(
+          ({ name }) => name === "execute_rizin_command",
+        ),
+    },
+    {
+      identity: sources.gdbProvider.GDB_PROVIDER_IDENTITY,
+      contracts: sources.gdbContracts.GDB_TOOL_CONTRACTS,
+    },
+    {
+      identity: sources.rizinDebugProvider.RIZIN_DEBUGGER_PROVIDER_IDENTITY,
+      contracts: sources.rizinDebugContracts.RIZIN_DEBUG_TOOL_CONTRACTS,
+    },
+    {
+      identity: sources.fridaProvider.FRIDA_PROVIDER_IDENTITY,
+      contracts: sources.fridaContracts.FRIDA_TOOL_CONTRACTS,
+    },
     {
       identity: sources.hopperProvider.HOPPER_PROVIDER_IDENTITY,
       contracts: declaredContracts(
@@ -180,8 +237,38 @@ export const providerCatalog = (sources) => {
         ),
     },
     {
+      identity: sources.captureProvider.TSHARK_PROVIDER_IDENTITY,
+      contracts: sources.captureContracts.CAPTURE_TOOL_CONTRACTS,
+    },
+    {
+      identity: sources.signalProvider.SIGROK_PROVIDER_IDENTITY,
+      contracts: sources.signalContracts.SIGNAL_TOOL_CONTRACTS,
+    },
+    {
+      identity: sources.wasmProvider.WABT_PROVIDER_IDENTITY,
+      contracts: sources.wasmContracts.WASM_TOOL_CONTRACTS.filter(
+        ({ kind }) => kind === "artifact-provider",
+      ),
+    },
+    {
       identity: sources.evmProvider.EVMOLE_PROVIDER_IDENTITY,
       contracts: sources.evmContracts.EVM_TOOL_CONTRACTS,
+    },
+    {
+      identity: sources.goProvider.GO_BINARY_PROVIDER_IDENTITY,
+      contracts: sources.goContracts.GO_TOOL_CONTRACTS,
+    },
+    {
+      identity: sources.rustProvider.RUST_BINARY_PROVIDER_IDENTITY,
+      contracts: sources.rustContracts.RUST_TOOL_CONTRACTS,
+    },
+    {
+      identity: sources.electronFuseProvider.ELECTRON_FUSE_PROVIDER_IDENTITY,
+      contracts: fuseContracts,
+    },
+    {
+      identity: sources.sqliteDomain.SQLITE_PROVIDER_IDENTITY,
+      contracts: sources.sqliteContracts.SQLITE_TOOL_CONTRACTS,
     },
     {
       identity: sources.artifactProviders.ARTIFACT_GRAPH_PROVIDER,
@@ -213,6 +300,14 @@ export const providerCatalog = (sources) => {
       contracts: sources.androidContracts.ANDROID_TOOL_CONTRACTS,
     },
     {
+      identity: sources.pcapProvider.PCAP_PROVIDER_IDENTITY,
+      contracts: sources.pcapContracts.PCAP_TOOL_CONTRACTS,
+    },
+    {
+      identity: sources.flutterProvider.FLUTTER_PROVIDER_IDENTITY,
+      contracts: sources.flutterContracts.FLUTTER_TOOL_CONTRACTS,
+    },
+    {
       identity: sources.apktoolProvider.APKTOOL_PROVIDER_IDENTITY,
       contracts: sources.apktoolContracts.APKTOOL_TOOL_CONTRACTS,
     },
@@ -226,6 +321,11 @@ export const providerCatalog = (sources) => {
     },
     {
       identity: sources.webNetworkCaptureProvider.HAR_CAPTURE_PROVIDER_IDENTITY,
+      contracts:
+        sources.webNetworkCaptureContracts.WEB_NETWORK_CAPTURE_TOOL_CONTRACTS,
+    },
+    {
+      identity: sources.webNetworkCaptureProvider.SAZ_CAPTURE_PROVIDER_IDENTITY,
       contracts:
         sources.webNetworkCaptureContracts.WEB_NETWORK_CAPTURE_TOOL_CONTRACTS,
     },
@@ -330,17 +430,23 @@ const electronContractSlices = (sources) => {
       ({ name }) =>
         name !== "analyze_javascript_application" &&
         name !== "reconcile_javascript_runtime" &&
-        name !== "capture_electron_scenario",
+        name !== "capture_electron_scenario" &&
+        name !== "inspect_electron_fuses",
     );
   const activeContracts =
     sources.electronContracts.ELECTRON_TOOL_CONTRACTS.filter(
       ({ name }) => name === "capture_electron_scenario",
     );
+  const fuseContracts =
+    sources.electronContracts.ELECTRON_TOOL_CONTRACTS.filter(
+      ({ name }) => name === "inspect_electron_fuses",
+    );
   if (
     applicationContracts.length !== 1 ||
     reconciliationContracts.length !== 1 ||
     observationContracts.length !== 2 ||
-    activeContracts.length !== 1
+    activeContracts.length !== 1 ||
+    fuseContracts.length !== 1
   )
     throw new Error("Electron provider capability ownership drifted");
   return {
@@ -348,5 +454,6 @@ const electronContractSlices = (sources) => {
     reconciliationContracts,
     observationContracts,
     activeContracts,
+    fuseContracts,
   };
 };

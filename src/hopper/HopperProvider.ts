@@ -5,6 +5,7 @@ import { accessSync, constants, statSync } from "node:fs";
 import { createAnalysisExecution } from "../application/AnalysisProvider.js";
 import type {
   AnalysisClient,
+  AnalysisOperation,
   AnalysisClientContext,
   AnalysisProfileResolutionOptions,
   AnalysisProviderCandidate,
@@ -15,7 +16,11 @@ import type {
 } from "../application/AnalysisProvider.js";
 import type { AnalysisProfileCommitment } from "../domain/analysisProfile.js";
 import type { AppConfig } from "../config/types.js";
-import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
+import {
+  isElfMetadataArchitecture,
+  type BinaryTarget,
+} from "../domain/binaryTargetTypes.js";
+import type { JsonValue } from "../domain/jsonValue.js";
 import type { Logger } from "pino";
 import { AnalysisCapabilityUnavailableError } from "../domain/analysisErrorCore.js";
 import { err, ok } from "../domain/result.js";
@@ -109,6 +114,14 @@ export class HopperProvider implements AnalysisProviderCandidate {
         reason: `Hopper cannot directly analyze ${target.kind} targets.`,
         diagnostics,
       };
+    if (target.kind === "database" && this.platform === "darwin")
+      return {
+        status: "unsupported",
+        code: "target_kind_unsupported",
+        reason:
+          "This Hopper macOS launcher cannot start REA's analysis bridge when opening a saved Hopper database. Open an executable target instead; saved-database analysis is unavailable until Hopper exposes a database launch route that runs the bridge script.",
+        diagnostics,
+      };
     if (target.kind === "database")
       return {
         status: "supported",
@@ -116,11 +129,25 @@ export class HopperProvider implements AnalysisProviderCandidate {
         reason: null,
         diagnostics,
       };
-    if (target.architecture === "mips")
+    if (isElfMetadataArchitecture(target.architecture))
       return {
         status: "unsupported",
         code: "architecture_unsupported",
-        reason: "REA's Hopper adapter does not admit MIPS targets.",
+        reason: `REA's Hopper adapter does not admit ${
+          target.architecture === "mips"
+            ? "MIPS"
+            : target.architecture === "riscv"
+              ? "RISC-V"
+              : "PowerPC"
+        } targets.`,
+        diagnostics,
+      };
+    if (target.format === "raw-binary")
+      return {
+        status: "unsupported",
+        code: "target_format_unsupported",
+        reason:
+          "Headerless raw-binary analysis requires the Ghidra adapter with a caller-supplied architecture and entry point.",
         diagnostics,
       };
     if (target.format === "dos-mz" || target.format === "dos-com")
@@ -237,11 +264,47 @@ export class HopperProvider implements AnalysisProviderCandidate {
           : { launchMode: "native" as const }),
       }),
       ...(context === undefined ? {} : { runId: context.runId }),
+      startupTimeoutMs: this.config.hopperStartupTimeoutMs,
       logger: this.logger.child({ layer: "bridge" }),
       onDiagnostic: (diagnostic) =>
         this.logger.info(diagnostic, "Hopper bridge reported a diagnostic"),
     });
     const regexSearch = new HopperRegexSearch(client);
+    const projectExecution = (
+      operation: AnalysisOperation,
+      normalized: JsonValue,
+      rawResult: JsonValue | null = null,
+    ) =>
+      createAnalysisExecution(normalized, executionProvider, {
+        // Only the file-offset mapping differs from Hopper's reply.
+        rawResult,
+        ...(profile === undefined ? {} : { analysisProfile: profile }),
+        ...(operation === "procedure_callers" ||
+        operation === "procedure_callees" ||
+        operation === "analyze_function"
+          ? { relationshipCoverage: { status: "complete" as const } }
+          : {}),
+        limitations: [
+          ...(preparedImage === undefined
+            ? []
+            : [
+                "REA loaded a verified thin Mach-O slice from the original FAT source. Identity and file offsets refer to the original file. The owned temporary image and its Hopper document close together, including on MCP shutdown.",
+              ]),
+          ...(CAPABILITIES.find(
+            (descriptor) => descriptor.operation === operation,
+          )?.limitations ?? []),
+          ...(operation === "read_bytes"
+            ? [
+                "Hopper byte reads stop at the containing segment's exclusive end; a readable prefix is returned with complete=false when the requested range crosses it.",
+              ]
+            : []),
+          ...(operation === "procedure_references"
+            ? [
+                "Native CallReference classifications and unresolved targets are preserved. Detailed reference flags and coverage beyond reported CallReference objects remain unknown.",
+              ]
+            : []),
+        ],
+      });
     return {
       execute: async (operation, parameters, options) => {
         const result =
@@ -256,35 +319,25 @@ export class HopperProvider implements AnalysisProviderCandidate {
             ? await mapHopperFileOffset(target, result.value, options?.signal)
             : result;
         return mapped.ok
-          ? {
-              ok: true,
-              value: createAnalysisExecution(mapped.value, executionProvider, {
-                // Only the file-offset mapping differs from Hopper's reply.
-                rawResult: mapped === result ? null : result.value,
-                ...(profile === undefined ? {} : { analysisProfile: profile }),
-                limitations: [
-                  ...(preparedImage === undefined
-                    ? []
-                    : [
-                        "REA loaded a verified thin Mach-O slice from the original FAT64 source. Identity and file offsets refer to the original file. The owned temporary image and its Hopper document close together, including on MCP shutdown.",
-                      ]),
-                  ...(CAPABILITIES.find(
-                    (descriptor) => descriptor.operation === operation,
-                  )?.limitations ?? []),
-                  ...(operation === "read_bytes"
-                    ? [
-                        "Hopper byte reads stop at the containing segment's exclusive end; a readable prefix is returned with complete=false when the requested range crosses it.",
-                      ]
-                    : []),
-                  ...(operation === "procedure_references"
-                    ? [
-                        "Native CallReference classifications and unresolved targets are preserved. Detailed reference flags and coverage beyond reported CallReference objects remain unknown.",
-                      ]
-                    : []),
-                ],
-              }),
-            }
+          ? ok(
+              projectExecution(
+                operation,
+                mapped.value,
+                mapped === result ? null : result.value,
+              ),
+            )
           : mapped;
+      },
+      executeIfReady: async (operation, parameters, options) => {
+        if (operation !== "list_documents" && operation !== "list_procedures")
+          return undefined;
+        const result = await client.callToolIfReady(
+          operation,
+          parameters,
+          options?.signal === undefined ? {} : { signal: options.signal },
+        );
+        if (result === undefined || !result.ok) return result;
+        return ok(projectExecution(operation, result.value));
       },
       runtimeLineageSnapshots: () => {
         const observation = client.runtimeLineage();

@@ -1,3 +1,4 @@
+import { INSPECT_ANALYSIS_VIEW_OPERATION } from "../../domain/analysisView/analysisViewErrors.js";
 import { z } from "zod";
 
 import { ANALYSIS_VIEW_PROVIDER } from "../InvestigationProviders.js";
@@ -5,7 +6,10 @@ import type { EvidenceLookup } from "../EvidenceInputResolver.js";
 import { resolveEvidenceInput } from "../EvidenceInputResolver.js";
 import type { EvidenceWriter } from "../investigation/InvestigationRecordPort.js";
 import type { AnalysisError } from "../../domain/analysisErrorBase.js";
-import { AnalysisCapabilityUnavailableError } from "../../domain/analysisErrorCore.js";
+import {
+  AnalysisCapabilityUnavailableError,
+  AnalysisInputError,
+} from "../../domain/analysisErrorCore.js";
 import { analysisInputErrorFromIssues } from "../../domain/inputIssueProjection.js";
 import { EvidenceIntegrityError } from "../../domain/evidenceErrors.js";
 import {
@@ -14,14 +18,15 @@ import {
   type Evidence,
 } from "../../domain/evidence.js";
 import {
-  INSPECT_ANALYSIS_VIEW_OPERATION,
   inspectAnalysisViewInputSchema,
   projectAnalysisView,
   type AnalysisViewResult,
   type InspectAnalysisViewInput,
 } from "../../domain/analysisView/analysisView.js";
 import { jsonValueSchema } from "../../domain/jsonValue.js";
+import { isImmutableJsonSnapshot } from "../../domain/immutableJson.js";
 import { err, ok, type Result } from "../../domain/result.js";
+import { WebNetworkApiSurfaceAccumulator } from "../../domain/analysisView/WebNetworkApiSurfaceAccumulator.js";
 
 /** Authenticate a selected-view request and project already completed Evidence. */
 export const inspectAnalysisView = (
@@ -41,11 +46,22 @@ export const inspectAnalysisView = (
   return inspectAnalysisViewValidated(parsed.data, lookup);
 };
 
-/** Project a view from input already parsed by a trusted adapter. */
+/** Authenticate borrowed inline Evidence after adapter envelope validation. */
 export const inspectAnalysisViewValidated = (
   input: InspectAnalysisViewInput,
   lookup?: EvidenceLookup,
 ): Result<Evidence, AnalysisError> => {
+  const accumulator =
+    input.view.kind === "api-surface"
+      ? new WebNetworkApiSurfaceAccumulator(
+          undefined,
+          input.view.include_query_parameter_names === true,
+        )
+      : undefined;
+  if (input.source.kind === "inline" && accumulator !== undefined) {
+    const admitted = accumulator.admitInlineEvidence(input.source.evidence);
+    if (!admitted.ok) return admitted;
+  }
   const resolved = resolveAnalysisViewSource(input.source, lookup);
   if (!resolved.ok) return resolved;
   const parent = resolved.value;
@@ -54,7 +70,11 @@ export const inspectAnalysisViewValidated = (
       evidenceId: parent.evidence_id,
       operation: parent.operation,
       normalizedResult: parent.normalized_result,
+      // Sealing an Evidence root deep-freezes it; only the root is registered.
+      sealedResult: isImmutableJsonSnapshot(parent),
+      subject: parent.subject,
       limitations: parent.limitations,
+      parameters: parent.parameters,
       artifact:
         parent.subject === null
           ? null
@@ -64,6 +84,7 @@ export const inspectAnalysisViewValidated = (
             },
     },
     input.view,
+    accumulator,
   );
   if (!projected.ok) return projected;
   if (
@@ -84,6 +105,38 @@ export interface AnalysisViewRetention {
   readonly recordEvidence: EvidenceWriter["recordEvidence"] | undefined;
 }
 
+/** Fail before analysis when selected delivery cannot keep its complete source. */
+export const requireAnalysisViewRetention = (
+  operation: string,
+  retention: AnalysisViewRetention,
+): Result<
+  {
+    readonly evidenceById: EvidenceLookup;
+    readonly recordEvidence: EvidenceWriter["recordEvidence"];
+  },
+  AnalysisError
+> => {
+  if (
+    retention.recordEvidence === undefined ||
+    retention.evidenceById === undefined
+  )
+    return err(
+      new AnalysisCapabilityUnavailableError(
+        ANALYSIS_VIEW_PROVIDER.id,
+        operation,
+        "summary detail requires a server session that retains Evidence for later views",
+        {
+          userMessage:
+            "This server does not retain Evidence. Select detail complete to receive the complete analysis inline.",
+        },
+      ),
+    );
+  return ok({
+    evidenceById: retention.evidenceById,
+    recordEvidence: retention.recordEvidence,
+  });
+};
+
 /**
  * Retain complete analysis Evidence in the session, then project its summary
  * view from the retained record. Callers page or select the rest through
@@ -93,29 +146,16 @@ export const summarizeRetainedAnalysis = (
   evidence: Evidence,
   retention: AnalysisViewRetention,
 ): Result<Evidence, AnalysisError> => {
-  if (
-    retention.recordEvidence === undefined ||
-    retention.evidenceById === undefined
-  )
-    return err(
-      new AnalysisCapabilityUnavailableError(
-        ANALYSIS_VIEW_PROVIDER.id,
-        evidence.operation,
-        "summary detail requires a server session that retains Evidence for later views",
-        {
-          userMessage:
-            "This server does not retain Evidence. Select detail complete to receive the complete analysis inline.",
-        },
-      ),
-    );
-  const recorded = retention.recordEvidence(evidence);
+  const ready = requireAnalysisViewRetention(evidence.operation, retention);
+  if (!ready.ok) return ready;
+  const recorded = ready.value.recordEvidence(evidence);
   if (!recorded.ok) return recorded;
   return inspectAnalysisViewValidated(
     {
       source: { kind: "retained-evidence", evidence_id: evidence.evidence_id },
       view: { kind: "summary" },
     },
-    retention.evidenceById,
+    ready.value.evidenceById,
   );
 };
 
@@ -125,6 +165,18 @@ const resolveAnalysisViewSource = (
 ): Result<Evidence, AnalysisError> => {
   if (source.kind === "retained-evidence")
     return resolveEvidenceInput(source, lookup);
+  const invalidDataPath = inlineEvidenceInvalidDataPath(source.evidence);
+  if (invalidDataPath !== undefined)
+    return err(
+      new AnalysisInputError(INSPECT_ANALYSIS_VIEW_OPERATION, undefined, [
+        {
+          path: ["source", "evidence", ...invalidDataPath],
+          reason: "invalid_type",
+          message:
+            "Inline Evidence must contain plain JSON data properties without accessors or cycles.",
+        },
+      ]),
+    );
   try {
     return ok(parseEvidence(source.evidence));
   } catch (cause: unknown) {
@@ -149,6 +201,53 @@ const resolveAnalysisViewSource = (
       );
     throw cause;
   }
+};
+
+/** Reject non-JSON object behavior before Zod reads caller-owned Evidence. */
+const inlineEvidenceInvalidDataPath = (
+  root: unknown,
+): readonly (string | number)[] | undefined => {
+  const active = new Set<object>();
+  const pending: {
+    readonly value: unknown;
+    readonly path: readonly (string | number)[];
+    readonly exit?: object;
+  }[] = [{ value: root, path: [] }];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (current === undefined) continue;
+    if (current.exit !== undefined) {
+      active.delete(current.exit);
+      continue;
+    }
+    const { value, path } = current;
+    if (typeof value !== "object" || value === null) continue;
+    const isArray = Array.isArray(value);
+    const prototype = Object.getPrototypeOf(value);
+    if (
+      (isArray && prototype !== Array.prototype) ||
+      (!isArray && prototype !== Object.prototype && prototype !== null) ||
+      active.has(value)
+    )
+      return path;
+
+    active.add(value);
+    pending.push({ value, path, exit: value });
+    const keys = Object.getOwnPropertyNames(value);
+    for (let index = keys.length - 1; index >= 0; index -= 1) {
+      const key = keys[index];
+      if (key === undefined) continue;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      const childPath = [
+        ...path,
+        isArray && /^(0|[1-9]\d*)$/u.test(key) ? Number(key) : key,
+      ];
+      if (descriptor === undefined || !Object.hasOwn(descriptor, "value"))
+        return childPath;
+      pending.push({ value: descriptor.value, path: childPath });
+    }
+  }
+  return undefined;
 };
 
 const createAnalysisViewEvidence = (
@@ -176,7 +275,11 @@ const createAnalysisViewEvidence = (
     },
     result: jsonValueSchema.parse(result),
     rawResult: null,
-    confidence: "derived",
+    confidence:
+      // Paging follows the full grouping, so any templated group makes every page inferred.
+      result.kind === "api-surface" && result.templated_groups > 0
+        ? "inferred"
+        : "derived",
     authority: parent.authority,
     limitations: result.limitations,
     locations: [

@@ -24,6 +24,26 @@ const pollSchema = z.strictObject({
   exitCode: z.number().int().nonnegative().max(0xffff_ffff).nullable(),
   activeProcesses: z.number().int().nonnegative(),
 });
+// A commit-limited job reports its applied limit at launch and its
+// notification state on every poll; an unlimited job reports neither.
+const limitedPollSchema = pollSchema.extend({
+  memoryLimitReached: z.boolean(),
+  peakJobMemoryBytes: z
+    .number()
+    .int()
+    .nonnegative()
+    .max(Number.MAX_SAFE_INTEGER),
+});
+
+/** Optional native job controls for one owned Windows process tree. */
+export interface WindowsOwnedProcessOptions {
+  /** Open a writable protocol pipe; otherwise stdin is NUL. */
+  readonly protocolStdin?: boolean;
+  /** Job Object commit limit for the whole process tree, in bytes. */
+  readonly memoryLimitBytes?: number;
+  /** Verified native authority; defaults to the package-owned artifact. */
+  readonly authority?: WindowsNativeAuthority;
+}
 
 /** Encode one ordinary Windows argv token using the CRT backslash rules. */
 export const quoteWindowsProcessArgument = (value: string): string => {
@@ -47,7 +67,14 @@ export class WindowsOwnedProcess extends EventEmitter {
   #closed = false;
   #failure: string | undefined;
   #timer: NodeJS.Timeout | undefined;
+  #blockedWake: NodeJS.Timeout | undefined;
+  readonly #blockedOutput = new Set<PassThrough>();
+  #unreferenced = false;
   #cleanup: Promise<ProcessCleanupResult> | undefined;
+  readonly #memoryLimitBytes: number | undefined;
+  #memoryLimitReached = false;
+  #peakJobMemoryBytes: number | undefined;
+  #outputIncomplete = false;
 
   constructor(
     command: string,
@@ -55,13 +82,24 @@ export class WindowsOwnedProcess extends EventEmitter {
     cwd: string | undefined,
     environment: NodeJS.ProcessEnv,
     verbatim: boolean,
-    protocolStdin = false,
+    options: WindowsOwnedProcessOptions = {},
   ) {
     super();
-    this.#authority = requireWindowsNativeAuthority();
+    const protocolStdin = options.protocolStdin === true;
+    this.#memoryLimitBytes = options.memoryLimitBytes;
+    this.#authority = options.authority ?? requireWindowsNativeAuthority();
     if (protocolStdin && this.#authority.inspection.protocolStdin !== true)
       throw new Error(
         "The bundled Windows native artifact does not support owned protocol stdin; use a matching current Windows x64 REA package.",
+      );
+    // A requested limit is never dropped: an artifact without the control
+    // refuses the launch instead of starting an unlimited process.
+    if (
+      this.#memoryLimitBytes !== undefined &&
+      this.#authority.inspection.jobMemoryLimit !== true
+    )
+      throw new Error(
+        "The bundled Windows native artifact does not support Job Object memory limits; use a matching current Windows x64 REA package.",
       );
     const entries = Object.entries(environment)
       .filter((entry): entry is [string, string] => entry[1] !== undefined)
@@ -74,15 +112,24 @@ export class WindowsOwnedProcess extends EventEmitter {
         verbatim ? value : quoteWindowsProcessArgument(value),
       ),
     ].join(" ");
-    const launched = launchSchema.parse(
-      this.#authority.call("process_spawn", [
-        command,
-        line,
-        cwd ?? "",
-        entries,
-        ...(protocolStdin ? [true] : []),
-      ]),
-    );
+    // Earlier artifacts accept only 4 or 5 arguments; keep that shape unless
+    // a commit limit is requested.
+    let controls: unknown[] = protocolStdin ? [true] : [];
+    if (this.#memoryLimitBytes !== undefined)
+      controls = [protocolStdin, this.#memoryLimitBytes];
+    const spawned = this.#authority.call("process_spawn", [
+      command,
+      line,
+      cwd ?? "",
+      entries,
+      ...controls,
+    ]);
+    const launched =
+      this.#memoryLimitBytes === undefined
+        ? launchSchema.parse(spawned)
+        : launchSchema
+            .extend({ jobMemoryLimitBytes: z.literal(this.#memoryLimitBytes) })
+            .parse(spawned);
     this.pid = launched.pid;
     this.#handle = launched.handle;
     this.stdin = protocolStdin
@@ -123,6 +170,21 @@ export class WindowsOwnedProcess extends EventEmitter {
       this.#settle = resolve;
     });
     this.#schedule();
+  }
+
+  /** Whether the job reported reaching its commit limit; sticky once observed. */
+  get memoryLimitReached(): boolean {
+    return this.#memoryLimitReached;
+  }
+
+  /** Latest observed peak job commit; undefined for an unlimited job. */
+  get peakJobMemoryBytes(): number | undefined {
+    return this.#peakJobMemoryBytes;
+  }
+
+  /** True when cleanup destroyed a backpressured stream before all output was observed. */
+  get outputIncomplete(): boolean {
+    return this.#outputIncomplete;
   }
 
   async #writeInput(chunk: unknown): Promise<void> {
@@ -169,11 +231,26 @@ export class WindowsOwnedProcess extends EventEmitter {
     return this.#cleanup;
   }
 
+  /** Release event-loop references so unsettled jobs do not prevent host exit. */
+  unref(): void {
+    this.#unreferenced = true;
+    this.#timer?.unref();
+    this.#blockedWake?.unref();
+  }
+
+  /** Restore event-loop references when retrying process lifecycle observation. */
+  ref(): void {
+    this.#unreferenced = false;
+    this.#timer?.ref();
+    this.#blockedWake?.ref();
+  }
+
   async #stop(): Promise<ProcessCleanupResult> {
     if (this.#closed) return { cleaned: true, signaled: false };
     let timer: NodeJS.Timeout | undefined;
     try {
       const signaled = this.kill();
+      this.#discardBlockedOutput();
       this.#schedule();
       const settled = await Promise.race([
         this.#settled.then(() => true),
@@ -199,21 +276,73 @@ export class WindowsOwnedProcess extends EventEmitter {
     }
   }
 
-  #schedule(): void {
-    if (this.#closed || this.#timer !== undefined) return;
-    this.#timer = setTimeout(() => this.#poll(), 25);
+  #schedule(delay = 25): void {
+    if (
+      this.#closed ||
+      this.#timer !== undefined ||
+      this.#blockedOutput.size > 0
+    )
+      return;
+    this.#timer = setTimeout(() => this.#poll(), delay);
+    if (this.#unreferenced) this.#timer.unref();
+  }
+
+  #scheduleBlockedWake(): void {
+    if (
+      this.#closed ||
+      this.#blockedOutput.size === 0 ||
+      this.#blockedWake !== undefined
+    )
+      return;
+    this.#blockedWake = setTimeout(() => {
+      this.#blockedWake = undefined;
+      this.#scheduleBlockedWake();
+    }, 1_000);
+    if (this.#unreferenced) this.#blockedWake.unref();
+  }
+
+  #clearBlockedWake(): void {
+    if (this.#blockedWake !== undefined) clearTimeout(this.#blockedWake);
+    this.#blockedWake = undefined;
+  }
+
+  #unblockOutput(stream: PassThrough): void {
+    if (stream.destroyed) this.#outputIncomplete = true;
+    this.#blockedOutput.delete(stream);
+    if (this.#blockedOutput.size === 0) this.#clearBlockedWake();
+    this.#schedule(0);
+  }
+
+  #discardBlockedOutput(): void {
+    if (this.#blockedOutput.size > 0) this.#outputIncomplete = true;
+    for (const stream of this.#blockedOutput) stream.destroy();
+    this.#blockedOutput.clear();
+    this.#clearBlockedWake();
   }
 
   #poll(): void {
     this.#timer = undefined;
     if (this.#closed) return;
     try {
-      const state = pollSchema.parse(
-        this.#authority.call("process_poll", [this.#handle]),
-      );
+      const observed: unknown = this.#authority.call("process_poll", [
+        this.#handle,
+      ]);
+      let state: z.output<typeof pollSchema>;
+      if (this.#memoryLimitBytes === undefined)
+        state = pollSchema.parse(observed);
+      else {
+        const limited = limitedPollSchema.parse(observed);
+        // Recorded before exit is emitted, so exit listeners observe it.
+        this.#memoryLimitReached ||= limited.memoryLimitReached;
+        this.#peakJobMemoryBytes = limited.peakJobMemoryBytes;
+        state = limited;
+      }
       this.#failure = undefined;
-      if (state.stdout.length > 0) this.stdout.write(state.stdout);
-      if (state.stderr.length > 0) this.stderr.write(state.stderr);
+      // Stop native reads while either consumer is backpressured. A slower
+      // cadence still accumulates unbounded unread output in the parent heap.
+      const idle = state.stdout.length === 0 && state.stderr.length === 0;
+      this.#writeOutput(this.stdout, state.stdout);
+      this.#writeOutput(this.stderr, state.stderr);
       if (state.exitCode !== null && this.exitCode === null) {
         this.exitCode = state.exitCode;
         this.emit("exit", state.exitCode, null);
@@ -225,7 +354,7 @@ export class WindowsOwnedProcess extends EventEmitter {
         state.activeProcesses === 0
       ) {
         this.#release();
-      } else this.#schedule();
+      } else this.#schedule(idle ? 25 : 0);
     } catch (cause: unknown) {
       const failure = cause instanceof Error ? cause : new Error(String(cause));
       this.#failure = failure.message;
@@ -236,14 +365,35 @@ export class WindowsOwnedProcess extends EventEmitter {
     }
   }
 
+  #writeOutput(stream: PassThrough, bytes: Buffer): void {
+    if (bytes.length === 0 || stream.writableEnded) return;
+    if (stream.destroyed) {
+      this.#outputIncomplete = true;
+      return;
+    }
+    if (stream.write(bytes)) return;
+    this.#blockedOutput.add(stream);
+    const unblock = () => {
+      stream.off("drain", unblock);
+      stream.off("close", unblock);
+      this.#unblockOutput(stream);
+    };
+    stream.once("drain", unblock);
+    stream.once("close", unblock);
+    this.#scheduleBlockedWake();
+  }
+
   #release(): void {
     if (this.#closed) return;
     if (this.#timer !== undefined) clearTimeout(this.#timer);
+    this.#clearBlockedWake();
+    this.stdin?.destroy();
+    if (!this.stdout.destroyed) this.stdout.end();
+    if (!this.stderr.destroyed) this.stderr.end();
+    // End local streams before releasing the native handle. If release fails,
+    // the retained job can be retried without leaving output streams open.
     this.#authority.call("process_close", [this.#handle]);
     this.#closed = true;
-    this.stdin?.destroy();
-    this.stdout.end();
-    this.stderr.end();
     this.#settle?.();
     this.emit("close", this.exitCode, null);
   }

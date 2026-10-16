@@ -10,6 +10,45 @@ import {
   origin,
 } from "./javascriptSemanticAnalysis.fixture.js";
 
+describe("JavaScript semantic analysis: ESM import origins", () => {
+  it.each(["", "a", "0"])(
+    "preserves exact ESM import name %j in binding origins",
+    (name) => {
+      const ir = analyzeJavaScriptSemantics(
+        "import { " +
+          JSON.stringify(name) +
+          ' as selected } from "./module.mjs"; const alias = selected; export { alias };',
+      );
+      for (const binding of ["selected", "alias"])
+        expect(origin(topLevelBinding(ir, binding))).toEqual({
+          specifier: "./module.mjs",
+          importedPath: [name],
+        });
+      expect(ir.moduleLinks).toContainEqual(
+        expect.objectContaining({
+          kind: "import",
+          importedName: name,
+          localName: "selected",
+        }),
+      );
+    },
+  );
+
+  it("keeps default and namespace import origins distinct from an empty named import", () => {
+    const ir = analyzeJavaScriptSemantics(
+      'import value from "./module.mjs"; import * as namespace from "./module.mjs";',
+    );
+    expect(origin(topLevelBinding(ir, "value"))).toEqual({
+      specifier: "./module.mjs",
+      importedPath: ["default"],
+    });
+    expect(origin(topLevelBinding(ir, "namespace"))).toEqual({
+      specifier: "./module.mjs",
+      importedPath: [],
+    });
+  });
+});
+
 describe("JavaScript semantic analysis: structure 1", () => {
   it("resolves imports, require destructuring, aliases, assignments, and shadowing", () => {
     const ir = analyzeJavaScriptSemantics(`
@@ -38,10 +77,12 @@ describe("JavaScript semantic analysis: structure 1", () => {
     expect(origin(topLevelBinding(ir, "bus"))).toEqual({
       specifier: "electron",
       importedPath: ["ipcMain"],
+      resolutionMode: "require",
     });
     expect(origin(topLevelBinding(ir, "forwarded"))).toEqual({
       specifier: "electron",
       importedPath: ["ipcMain"],
+      resolutionMode: "require",
     });
     expect(topLevelBinding(ir, "assigned").provenance).toMatchObject({
       status: "ambiguous",
@@ -66,12 +107,13 @@ describe("JavaScript semantic analysis: structure 1", () => {
     expect(origin(innerBus)).toEqual({
       specifier: "./local-bus.js",
       importedPath: [],
+      resolutionMode: "require",
     });
     const shadow = onlyBinding(ir, "ipcRenderer");
     expect(shadow.provenance).toEqual({
-      status: "local",
+      status: "unknown",
       origins: [],
-      reason: null,
+      reason: "Parameter provenance depends on caller arguments.",
     });
     const shadowReference = ir.references.find(
       ({ name, bindingId, role }) =>
@@ -111,28 +153,6 @@ describe("JavaScript semantic analysis: structure 1", () => {
       );
     },
   );
-
-  it("preserves unshadowed require origins through aliases and assignments", () => {
-    const ir = analyzeJavaScriptSemantics(`
-      const { ipcMain: bus } = require("electron");
-      const forwarded = bus;
-      let assigned;
-      assigned = require("electron").ipcMain;
-      { const require = localLoader; require("./local.js"); }
-    `);
-    for (const name of ["bus", "forwarded"])
-      expect(origin(topLevelBinding(ir, name))).toEqual({
-        specifier: "electron",
-        importedPath: ["ipcMain"],
-      });
-    expect(topLevelBinding(ir, "assigned").provenance).toMatchObject({
-      status: "ambiguous",
-      origins: [{ specifier: "electron", importedPath: ["ipcMain"] }],
-    });
-    expect(
-      ir.moduleLinks.filter(({ kind }) => kind === "require"),
-    ).toHaveLength(1);
-  });
 
   it("propagates literal, template, object, conditional, and destructured values", () => {
     const ir = analyzeJavaScriptSemantics(`

@@ -21,6 +21,16 @@ Readiness is `rea inspect-apktool-client`: it runs `apktool --version` and
 reports the resolved launcher, its selection source, and its version. A
 missing launcher reports `capability_unavailable` with the
 `REA_APKTOOL_COMMAND` remediation rather than attempting an installation.
+`binary_session` uses the same host probe for tool availability; it does not
+validate a particular APK or guarantee that the selected input can be decoded.
+
+On Windows, a `.bat` or `.cmd` launcher (such as Chocolatey's `apktool.bat`)
+runs through an explicit `cmd.exe /d /s /c` call. That call has no AutoRun,
+no delayed expansion, and quotes every argument. A launcher path that
+contains `"`, `%`, `^`, `!`, `&`, `|`, `<` or `>` is reported as
+`not_configured` instead of being passed to `cmd.exe`. If REA's temporary
+decode paths contain those characters, decoding through a batch launcher
+reports `capability_unavailable`.
 
 ## Answer an analyst question
 

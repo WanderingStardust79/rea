@@ -7,7 +7,10 @@ import type {
 } from "../domain/webMcpDiscovery.js";
 import { jsonValueSchema } from "../domain/jsonValue.js";
 import { digestCanonicalValue } from "../domain/canonicalDigest.js";
-import { compositeKey } from "../domain/unicodeCodePointOrder.js";
+import {
+  compareUnicodeCodePoints,
+  compositeKey,
+} from "../domain/unicodeCodePointOrder.js";
 import type { CdpEndpointDiscovery, CdpEndpointTarget } from "./CdpEndpoint.js";
 import type { CdpConnection, CdpEvent } from "./CdpConnection.js";
 import { CdpCaptureCompleteness } from "./CdpCaptureCompleteness.js";
@@ -443,6 +446,24 @@ const normalizeTool = (
   }
   const description = cdpStringValue(value.description) ?? "";
   const annotations = recordValue(value.annotations);
+  const malformedAnnotations =
+    Object.hasOwn(value, "annotations") && annotations === undefined;
+  if (malformedAnnotations)
+    completeness.exclude("webmcp_tools", "invalid_protocol_value");
+  const annotation = (key: string): boolean | null => {
+    if (annotations === undefined || !Object.hasOwn(annotations, key))
+      return null;
+    const hint = annotations[key];
+    if (typeof hint === "boolean") return hint;
+    completeness.exclude("webmcp_tools", "invalid_protocol_value");
+    return null;
+  };
+  const consequential = annotation("consequential");
+  const unknownConsequential =
+    malformedAnnotations ||
+    (annotations !== undefined &&
+      Object.hasOwn(annotations, "consequential") &&
+      typeof annotations.consequential !== "boolean");
   const declaration = jsonValueSchema.safeParse(value.inputSchema);
   if (!declaration.success)
     completeness.exclude("webmcp_tools", "invalid_protocol_value");
@@ -463,9 +484,10 @@ const normalizeTool = (
       ? digestCanonicalValue(schema)
       : null,
     annotations: {
-      read_only: booleanOrNull(annotations?.readOnly),
-      untrusted_content: booleanOrNull(annotations?.untrustedContent),
-      autosubmit: booleanOrNull(annotations?.autosubmit),
+      read_only: annotation("readOnly"),
+      untrusted_content: annotation("untrustedContent"),
+      ...(unknownConsequential ? {} : { consequential }),
+      autosubmit: annotation("autosubmit"),
     },
     registration_source: registrationSource(
       recordValue(value.stackTrace),
@@ -521,7 +543,7 @@ const buildWebMcpResult = (options: WebMcpResultOptions): WebMcpDiscovery => {
     tools: {
       total: tools.size + completeness.droppedTotal,
       items: [...tools.values()].sort((left, right) =>
-        left.tool_key.localeCompare(right.tool_key),
+        compareUnicodeCodePoints(left.tool_key, right.tool_key),
       ),
     },
     completeness: completeness.snapshot(),
@@ -536,9 +558,6 @@ const toolKey = (frameUrl: string, frameId: string, name: string): string =>
   `webmcp_${createHash("sha256")
     .update(compositeKey([frameUrl, frameId, name]))
     .digest("hex")}`;
-
-const booleanOrNull = (value: unknown): boolean | null =>
-  typeof value === "boolean" ? value : null;
 
 const integerOrNull = (value: unknown): number | null => {
   const number = numberValue(value);

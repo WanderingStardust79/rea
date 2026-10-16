@@ -78,6 +78,8 @@ export interface ManagedMetadataLayout {
   readonly strings: MetadataStream;
   readonly guid: MetadataStream;
   readonly blob: MetadataStream;
+  /** Optional: assemblies without `ldstr` literals may omit #US. */
+  readonly userStrings: MetadataStream | null;
   readonly tables: ReadonlyMap<number, MetadataTableLayout>;
   readonly rowCounts: readonly number[];
   readonly stringIndexSize: 2 | 4;
@@ -135,7 +137,7 @@ const requireRange = (
     );
 };
 
-const align4 = (value: number): number => (value + 3) & ~3;
+const align4 = (value: number): number => Math.ceil(value / 4) * 4;
 
 const readStreamName = (
   bytes: Buffer,
@@ -358,6 +360,18 @@ const buildMetadataTables = ({
     if ((valid & (1n << BigInt(index))) === 0n) continue;
     tableCursor += 4;
   }
+  // CLR readers honor an optional extra-data word after the row counts.
+  // Its value is opaque; it is not a length or part of the first table row.
+  if (((tableBytes[6] ?? 0) & 0x40) !== 0) {
+    if (tableCursor > tableBytes.length - 4)
+      throw managedFailure(
+        "invalid-metadata-root",
+        "metadata.tables-extra-data",
+        "Metadata tables extra-data word is truncated",
+        tablesOffset + tableCursor,
+      );
+    tableCursor += 4;
+  }
   for (let index = 0; index < METADATA_TABLE_NAMES.length; index += 1) {
     const count = rowCounts[index] ?? 0;
     if ((valid & (1n << BigInt(index))) === 0n) continue;
@@ -419,6 +433,7 @@ export const readManagedMetadataLayout = (
     strings: requireStream(streams, "#Strings"),
     guid: requireStream(streams, "#GUID"),
     blob: requireStream(streams, "#Blob"),
+    userStrings: streams.get("#US") ?? null,
     tables,
     rowCounts,
     stringIndexSize: heaps.string,

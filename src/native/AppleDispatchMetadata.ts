@@ -4,7 +4,10 @@ import {
   nativeDispatchMetadataResultSchema,
   type ObjcSwiftMetadata,
 } from "../domain/native/objcSwiftMetadata.js";
-import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
+import {
+  isMachOFormat,
+  type BinaryTarget,
+} from "../domain/binaryTargetTypes.js";
 import {
   AnalysisCancelledError,
   AnalysisResourceConstraintError,
@@ -102,15 +105,22 @@ export const decodeAppleDispatchMetadata = (
     evidence,
     offset,
   };
-  const { failures, categoryIssues, examined, categoriesExamined } =
-    decodeObjcDispatchFacets({
-      bytes,
-      sections,
-      segments,
-      readers,
-      budget,
-      result,
-    });
+  const {
+    failures,
+    categoryIssues,
+    examined,
+    categoriesExamined,
+    objcListScanTruncated,
+    objcClassListScanTruncated,
+  } = decodeObjcDispatchFacets({
+    bytes,
+    sections,
+    segments,
+    readers,
+    budget,
+    maxListSlots: maxRecords,
+    result,
+  });
   const swiftRelative = createSwiftRelativeReader({
     bytes,
     readers,
@@ -160,6 +170,8 @@ export const decodeAppleDispatchMetadata = (
     categoryIssues,
     examined,
     categoriesExamined,
+    objcListScanTruncated,
+    objcClassListScanTruncated,
     truncated: budget.truncated,
     fixups,
     vtables,
@@ -174,7 +186,7 @@ export const inspectAppleDispatchMetadata = async (
   maxRecords: number,
   signal?: AbortSignal,
 ) => {
-  if (target.kind !== "executable" || target.format !== "mach-o")
+  if (target.kind !== "executable" || !isMachOFormat(target.format))
     throw new TypeError("Apple dispatch metadata requires a Mach-O target");
   const maximumBytes = 64 * 1024 * 1024;
   const capacityError = () =>

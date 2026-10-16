@@ -12,6 +12,12 @@ import { systemUninstallHost } from "./application/Uninstall.js";
 import { runUpdateCommand } from "./application/UpdateRuntime.js";
 import { createSystemDoctorHost } from "./doctorRuntime.js";
 import { PRODUCT_IDENTITY } from "./identity.js";
+import {
+  invokingPackageRunner,
+  packageRunnerRegistrationCommand,
+  withoutPackageRunnerIdentity,
+} from "./application/ClientRegistrationIdentity.js";
+import { snapshotEnvironment } from "./process/snapshotEnvironment.js";
 
 afterEach(() => vi.unstubAllEnvs());
 
@@ -86,6 +92,60 @@ it("composes provider diagnostics from selected configuration rather than ambien
   expect(JSON.stringify(inspections)).not.toContain("/ambient/");
 });
 
+it("preserves a validated selected JEB endpoint in setup registrations without claiming live readiness", async () => {
+  const root = await mkdtemp(join(tmpdir(), "rea-jeb-setup-"));
+  const endpoint = "http://127.0.0.1:8425/mcp/";
+  const ambientEndpoint = "http://127.0.0.1:8426/mcp";
+  vi.stubEnv("REA_JEB_MCP_URL", ambientEndpoint);
+  try {
+    const environment = {
+      HOME: root,
+      USERPROFILE: root,
+      CODEX_HOME: join(root, "codex"),
+      REA_JEB_MCP_URL: endpoint,
+    };
+    const doctorHost = createSystemDoctorHost(environment);
+    const setupHost = systemSetupHost(doctorHost, environment);
+    const state = await setupHost.initialSetupState();
+
+    expect(state.providerEnvironment).toHaveProperty(
+      "REA_JEB_MCP_URL",
+      endpoint,
+    );
+    const planned = await runSetup(
+      {
+        ...options(false),
+        dryRun: true,
+        clientIds: ["codex"],
+        installSkill: false,
+      },
+      setupHost,
+    );
+    expect(planned.status).toBe("planned");
+    expect(JSON.stringify(planned.plannedActions)).toContain(endpoint);
+    expect(JSON.stringify(planned.plannedActions)).not.toContain(
+      ambientEndpoint,
+    );
+
+    expect(
+      createSystemDoctorHost({}).providerRegistrationEnvironment?.(),
+    ).toEqual({});
+    expect(
+      createSystemDoctorHost({
+        REA_JEB_MCP_URL: "http://127.0.0.1:8425/mcp",
+      }).providerRegistrationEnvironment?.(),
+    ).toEqual({ REA_JEB_MCP_URL: "http://127.0.0.1:8425/mcp" });
+    expect(
+      createSystemDoctorHost({
+        REA_JEB_MCP_URL: "https://example.com/mcp",
+      }).providerRegistrationEnvironment?.(),
+    ).toEqual({});
+  } finally {
+    vi.unstubAllEnvs();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 it("passes only selected environment to updater subprocesses and drops npm invocation identity", async () => {
   vi.stubEnv("REA_UPDATE_MARKER", "ambient");
   const result = await runUpdateCommand(
@@ -98,3 +158,27 @@ it("passes only selected environment to updater subprocesses and drops npm invoc
   );
   expect(result).toEqual({ ok: true, value: '{"marker":"selected"}' });
 });
+
+it.each([
+  { userAgent: "npm/10.9.0 node/v24.11.0 win32 x64", runner: "npx" },
+  { userAgent: "bun/1.4.2 npm/? node/v26.3.0 win32 x64", runner: "bunx" },
+] as const)(
+  "registers the $runner launcher from a Windows CLI environment snapshot",
+  ({ userAgent, runner }) => {
+    // The CLI snapshot canonicalizes Windows variable names to upper case.
+    const environment = snapshotEnvironment(
+      { npm_command: "exec", npm_config_user_agent: userAgent },
+      "win32",
+    );
+    expect(invokingPackageRunner(environment, "win32")).toBe(runner);
+    expect(
+      systemSetupHost(
+        createDoctorHostFixture({ platform: "win32" }),
+        environment,
+      ).registrationCommand,
+    ).toEqual(packageRunnerRegistrationCommand(runner, "win32"));
+    expect(withoutPackageRunnerIdentity(environment, "win32")).toEqual({
+      NPM_CONFIG_USER_AGENT: userAgent,
+    });
+  },
+);

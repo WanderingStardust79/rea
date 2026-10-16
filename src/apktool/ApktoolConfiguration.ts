@@ -1,5 +1,12 @@
-import { AnalysisCancelledError } from "../domain/analysisErrorCore.js";
-import { isAbsolute } from "node:path";
+import {
+  AnalysisCancelledError,
+  AnalysisTimeoutError,
+} from "../domain/analysisErrorCore.js";
+import { isAbsolute, win32 } from "node:path";
+import { stat } from "node:fs/promises";
+import { snapshotEnvironment } from "../process/snapshotEnvironment.js";
+import { ABORTED, waitForAbortable } from "../process/AbortablePromise.js";
+import { ProviderStartupDeadline } from "../process/ProviderDeadline.js";
 
 import {
   execFileOutput,
@@ -8,6 +15,12 @@ import {
 import type { ProviderAvailability } from "../application/AnalysisProvider.js";
 import type { ProviderRejectionCode } from "../contracts/providerSelection.js";
 import type { JsonValue } from "../domain/jsonValue.js";
+import { gte, valid } from "semver";
+import {
+  isWindowsBatchFile,
+  windowsBatchCommand,
+  WindowsBatchCommandError,
+} from "../process/WindowsBatchCommand.js";
 
 /** Environment key selecting the caller's apktool launcher. */
 export const APKTOOL_COMMAND_ENV = "REA_APKTOOL_COMMAND";
@@ -22,31 +35,122 @@ export interface ApktoolCommandSelection {
 }
 
 /**
- * Resolve the caller-supplied apktool launcher. `REA_APKTOOL_COMMAND` must
- * be absolute so the selection stays explicit; without it, apktool is
- * resolved from `PATH` at run time. Both the upstream wrapper script and
- * `java -jar` launcher scripts work: REA only runs `<command> --version`
- * and `<command> d ...`.
+ * Preserve an explicit launcher, or resolve the default Windows command before
+ * choosing native versus batch process creation. POSIX keeps execFile's PATH
+ * lookup. The resolved selection is reused for the version and decode runs.
  */
-export const resolveApktoolCommand = (
+export const resolveApktoolCommand = async (
   environment: Readonly<Record<string, string | undefined>>,
-): ApktoolCommandSelection => {
-  const configured = environment[APKTOOL_COMMAND_ENV];
-  if (configured === undefined || configured.trim() === "")
+  platform: NodeJS.Platform = process.platform,
+  signal?: AbortSignal,
+): Promise<ApktoolCommandSelection> => {
+  if (signal?.aborted === true)
+    throw new AnalysisCancelledError("inspect_apktool_client");
+  const selectedEnvironment = snapshotEnvironment(environment, platform);
+  const configured = selectedEnvironment[APKTOOL_COMMAND_ENV];
+  if (configured !== undefined && configured.trim() !== "") {
+    if (
+      !(platform === "win32"
+        ? win32.isAbsolute(configured)
+        : isAbsolute(configured))
+    )
+      throw new ApktoolConfigurationFailure(
+        "not_absolute",
+        `${APKTOOL_COMMAND_ENV} must be an absolute path to the apktool launcher`,
+        { configured_command: configured },
+      );
+    return { command: configured, commandSource: "environment" };
+  }
+  if (platform !== "win32")
     return { command: "apktool", commandSource: "path" };
-  if (!isAbsolute(configured))
-    throw new ApktoolConfigurationFailure(
-      "not_absolute",
-      `${APKTOOL_COMMAND_ENV} must be an absolute path to the apktool launcher`,
-      { configured_command: configured },
-    );
-  return { command: configured, commandSource: "environment" };
+  const extensions = (selectedEnvironment.PATHEXT ?? ".EXE;.COM;.BAT;.CMD")
+    .split(";")
+    .filter((extension) => extension !== "");
+  for (const extension of extensions)
+    if (!extension.startsWith(".") || /[\\/:\0]/u.test(extension))
+      throw new ApktoolConfigurationFailure(
+        "command_unresolved",
+        "Windows PATHEXT must contain filename extensions, not paths",
+        {
+          selected_command: "apktool",
+          command_source: "path",
+          invalid_extension: extension,
+        },
+      );
+  const directories = (selectedEnvironment.PATH ?? "")
+    .split(";")
+    .filter((directory) => directory !== "");
+  if (selectedEnvironment.NODEFAULTCURRENTDIRECTORYINEXEPATH === undefined)
+    directories.unshift(process.cwd());
+  // A single deadline owns the whole PATH search, including filesystem waits.
+  const deadline = new ProviderStartupDeadline(VERSION_TIMEOUT_MS, signal);
+  const lookupInterruption = () =>
+    deadline.interruption === "cancelled"
+      ? new AnalysisCancelledError("inspect_apktool_client")
+      : new AnalysisTimeoutError("inspect_apktool_client", VERSION_TIMEOUT_MS, {
+          diagnostics: { phase: "windows_path_lookup" },
+        });
+  try {
+    for (const entry of directories) {
+      const directory =
+        entry.startsWith('"') && entry.endsWith('"')
+          ? entry.slice(1, -1)
+          : entry;
+      for (const extension of extensions) {
+        if (deadline.interruption !== undefined) throw lookupInterruption();
+        const candidate = win32.resolve(directory, `apktool${extension}`);
+        try {
+          const metadata = await waitForAbortable(
+            stat(candidate),
+            deadline.signal,
+          );
+          if (metadata === ABORTED || deadline.interruption !== undefined)
+            throw lookupInterruption();
+          if (metadata.isFile())
+            return { command: candidate, commandSource: "path" };
+        } catch (cause: unknown) {
+          if (deadline.interruption !== undefined) throw lookupInterruption();
+          const code =
+            typeof cause === "object" && cause !== null
+              ? Reflect.get(cause, "code")
+              : undefined;
+          if (code === "ENOENT" || code === "ENOTDIR") continue;
+          throw new ApktoolConfigurationFailure(
+            "command_unresolved",
+            `The PATH-selected apktool launcher could not be inspected: ${candidate}`,
+            {
+              selected_command: "apktool",
+              command_source: "path",
+              candidate_path: candidate,
+              ...(typeof code === "string" ? { filesystem_error: code } : {}),
+            },
+            { cause },
+          );
+        }
+      }
+    }
+  } finally {
+    deadline.dispose();
+  }
+
+  throw new ApktoolConfigurationFailure(
+    "command_missing",
+    "The apktool launcher was not found on the selected Windows PATH/PATHEXT",
+    {
+      selected_command: "apktool",
+      command_source: "path",
+      remediation: `Set ${APKTOOL_COMMAND_ENV} to an absolute apktool launcher, or add its directory and extension to PATH and PATHEXT`,
+    },
+  );
 };
 
 export type ApktoolConfigurationFailureCode =
   | "not_absolute"
   | "command_missing"
-  | "version_unresolved";
+  | "command_unresolved"
+  | "launcher_unsupported"
+  | "version_unresolved"
+  | "unsupported_version";
 
 export class ApktoolConfigurationFailure extends Error {
   constructor(
@@ -59,11 +163,45 @@ export class ApktoolConfigurationFailure extends Error {
   }
 }
 
-export interface ApktoolClientIdentity {
-  readonly version: string | null;
+export type ApktoolClientIdentity =
+  | { readonly version: string; readonly reportedVersion?: never }
+  | { readonly version: null; readonly reportedVersion: string | null };
+
+/** Process creation for one apktool run on the selected host. */
+export interface ApktoolInvocation {
+  readonly command: string;
+  readonly arguments: readonly string[];
+  readonly windowsVerbatimArguments: boolean;
 }
 
-/** Read the version from `apktool --version` output (first non-empty line). */
+/**
+ * Run the selected launcher directly, or through cmd.exe when Windows can
+ * only execute it there (the Chocolatey `apktool.bat` and `java -jar`
+ * wrapper scripts). Throws WindowsBatchCommandError when a token cannot be
+ * passed to cmd.exe safely.
+ */
+export const apktoolInvocation = (
+  selection: ApktoolCommandSelection,
+  arguments_: readonly string[],
+  environment: Readonly<NodeJS.ProcessEnv>,
+  platform: NodeJS.Platform = process.platform,
+): ApktoolInvocation =>
+  platform === "win32" && isWindowsBatchFile(selection.command)
+    ? {
+        ...windowsBatchCommand({
+          environment,
+          batchPath: selection.command,
+          arguments: arguments_,
+        }),
+        windowsVerbatimArguments: true,
+      }
+    : {
+        command: selection.command,
+        arguments: arguments_,
+        windowsVerbatimArguments: false,
+      };
+
+/** Read the version from Apktool's single-line `--version` response. */
 export const parseApktoolVersionOutput = (
   stdout: string,
 ): ApktoolClientIdentity => {
@@ -71,7 +209,17 @@ export const parseApktoolVersionOutput = (
     .split(/\r?\n/u)
     .map((entry) => entry.trim())
     .find((entry) => entry !== "");
-  return { version: line === undefined ? null : line };
+  if (line === undefined || valid(line) === null)
+    return { version: null, reportedVersion: line ?? null };
+  return { version: line };
+};
+
+const supportsDocumentedApktoolVersion = (version: string): boolean => {
+  // Debian's verified 2.7.0-dirty build is a downstream build marker, not a
+  // prerelease. Treat only that known marker as build metadata for the floor.
+  const comparisonVersion = version.replace(/-dirty$/u, "+dirty");
+  const parsedVersion = valid(comparisonVersion);
+  return parsedVersion !== null && gte(parsedVersion, "2.7.0");
 };
 
 /** Probe the selected apktool launcher without decoding anything. */
@@ -79,16 +227,45 @@ export const inspectApktoolClient = async (
   selection: ApktoolCommandSelection,
   signal?: AbortSignal,
   environment: Readonly<Record<string, string | undefined>> = process.env,
+  platform: NodeJS.Platform = process.platform,
 ): Promise<ApktoolClientIdentity> => {
+  const hostEnvironment = snapshotEnvironment(environment, platform);
+  let invocation: ApktoolInvocation;
   try {
-    const { stdout } = await execFileOutput(selection.command, ["--version"], {
-      timeout: VERSION_TIMEOUT_MS,
-      stopSignal: "SIGTERM",
-      maxBuffer: VERSION_MAX_OUTPUT_BYTES,
-      env: { ...process.env, ...environment },
-      ...(signal === undefined ? {} : { signal }),
-    });
-    return parseApktoolVersionOutput(stdout);
+    invocation = apktoolInvocation(
+      selection,
+      ["--version"],
+      hostEnvironment,
+      platform,
+    );
+  } catch (cause) {
+    if (!(cause instanceof WindowsBatchCommandError)) throw cause;
+    throw new ApktoolConfigurationFailure(
+      "launcher_unsupported",
+      `The selected apktool launcher cannot be run through cmd.exe: ${cause.message}`,
+      {
+        selected_command: selection.command,
+        command_source: selection.commandSource,
+        remediation: `Set ${APKTOOL_COMMAND_ENV} to a launcher path without cmd.exe metacharacters (" % ^ ! & | < >), or to a native apktool executable`,
+      },
+      { cause },
+    );
+  }
+  let stdout: string;
+  let stderr: string;
+  try {
+    ({ stdout, stderr } = await execFileOutput(
+      invocation.command,
+      invocation.arguments,
+      {
+        windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+        timeout: VERSION_TIMEOUT_MS,
+        stopSignal: "SIGTERM",
+        maxBuffer: VERSION_MAX_OUTPUT_BYTES,
+        env: hostEnvironment,
+        ...(signal === undefined ? {} : { signal }),
+      },
+    ));
   } catch (cause) {
     const failure = execFileOutputFailure(cause);
     if (signal?.aborted || failure?.code === "ABORT_ERR")
@@ -119,6 +296,33 @@ export const inspectApktoolClient = async (
       { cause },
     );
   }
+  const identity = parseApktoolVersionOutput(stdout);
+  if (identity.version === null)
+    throw new ApktoolConfigurationFailure(
+      "version_unresolved",
+      "The selected apktool launcher exited successfully but did not report a recognizable version",
+      {
+        selected_command: selection.command,
+        command_source: selection.commandSource,
+        version_probe: "unrecognized_output",
+        reported_version: identity.reportedVersion,
+        stdout,
+        stderr,
+      },
+    );
+  if (!supportsDocumentedApktoolVersion(identity.version))
+    throw new ApktoolConfigurationFailure(
+      "unsupported_version",
+      `The selected Apktool version ${identity.version} is older than the supported minimum 2.7.0`,
+      {
+        selected_command: selection.command,
+        command_source: selection.commandSource,
+        reported_version: identity.version,
+        minimum_version: "2.7.0",
+        remediation: `Use Apktool 2.7.0 or newer; see docs/apktool-resource-analysis.md.`,
+      },
+    );
+  return identity;
 };
 
 /** Availability in the shape shared by every provider. */
@@ -127,9 +331,13 @@ const rejectionCodeOf = (
 ): ProviderRejectionCode =>
   code === "command_missing"
     ? "executable_missing"
-    : code === "not_absolute"
+    : code === "not_absolute" ||
+        code === "launcher_unsupported" ||
+        code === "command_unresolved"
       ? "not_configured"
-      : "version_unresolved";
+      : code === "unsupported_version"
+        ? "unsupported_version"
+        : "version_unresolved";
 
 export const apktoolConfigurationAvailability = (
   cause: ApktoolConfigurationFailure,

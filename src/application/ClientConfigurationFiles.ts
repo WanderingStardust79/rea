@@ -10,6 +10,22 @@ import {
 } from "./ClientConfigurationDocument.js";
 import type { SetupClient } from "./SupportedClients.js";
 import { clientRegistrationEnvironment } from "./ClientRegistrationEnvironment.js";
+import type { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
+import type { ConfigurationError } from "../domain/configurationErrors.js";
+
+/** A parsed layer retains its path so rereading the write target replaces only that layer. */
+export interface ClientConfigurationSource extends ClientConfigurationDocument {
+  readonly sourcePath: string;
+}
+
+const invalidEnvironment = (
+  path: string,
+  error: ConfigurationError,
+): ClientConfigurationFileError => ({
+  kind: "malformed",
+  path,
+  detail: `Configuration ${path} has an invalid REA server environment: ${error.settings.map(({ setting, constraint }) => `${setting}: ${constraint}`).join("; ")}. Repair it before rerunning setup.`,
+});
 
 /** A named source failure that setup can explain without losing the bad path. */
 export interface ClientConfigurationFileError {
@@ -22,9 +38,15 @@ export interface ClientConfigurationFileError {
 /** Preserve named read failures and distinguish a missing source from an empty file. */
 export const readConfigurationText = async (
   path: string,
+  resources?: ArtifactResourceScope,
 ): Promise<Result<string | undefined, ClientConfigurationFileError>> => {
   try {
-    return ok(await readRegularFileText(path));
+    return ok(
+      await readRegularFileText(
+        path,
+        resources === undefined ? {} : { resources },
+      ),
+    );
   } catch (cause: unknown) {
     if (cause instanceof Error && "code" in cause && cause.code === "ENOENT")
       return ok(undefined);
@@ -43,10 +65,11 @@ export const readConfigurationText = async (
 export const readConfigurationFile = async (
   path: string,
   format: SetupClient["format"],
+  resources?: ArtifactResourceScope,
 ): Promise<
   Result<ClientConfigurationDocument | undefined, ClientConfigurationFileError>
 > => {
-  const source = await readConfigurationText(path);
+  const source = await readConfigurationText(path, resources);
   if (!source.ok) return source;
   const content = source.value;
   if (content === undefined) return ok(undefined);
@@ -64,24 +87,34 @@ export const readConfigurationFile = async (
 /** Read every applicable user file; malformed lower-priority files also stop setup. */
 export const readClientConfigurationFiles = async (
   client: SetupClient,
+  resources?: ArtifactResourceScope,
 ): Promise<
-  Result<readonly ClientConfigurationDocument[], ClientConfigurationFileError>
+  Result<readonly ClientConfigurationSource[], ClientConfigurationFileError>
 > => {
-  const documents: ClientConfigurationDocument[] = [];
+  const documents: ClientConfigurationSource[] = [];
   for (const path of client.configPaths ?? [client.configPath]) {
-    const document = await readConfigurationFile(path, client.format);
+    const document = await readConfigurationFile(
+      path,
+      client.format,
+      resources,
+    );
     if (!document.ok) return document;
     if (document.value !== undefined) {
-      const environment = clientRegistrationEnvironment(document.value);
+      const environment = clientRegistrationEnvironment(
+        document.value,
+        {},
+        "fragment",
+      );
       if (!environment.ok)
-        return err({
-          kind: "malformed",
-          path,
-          detail: `Configuration ${path} has an invalid REA server environment: ${environment.error.settings.map(({ setting, constraint }) => `${setting}: ${constraint}`).join("; ")}. Repair it before rerunning setup.`,
-        });
-      documents.push(document.value);
+        return err(invalidEnvironment(path, environment.error));
+      documents.push({ ...document.value, sourcePath: path });
     }
   }
+  const environment = clientRegistrationEnvironment(
+    effectiveClientConfiguration(documents),
+  );
+  if (!environment.ok)
+    return err(invalidEnvironment(client.configPath, environment.error));
   return ok(documents);
 };
 
@@ -104,8 +137,24 @@ const isObject = (value: unknown): value is Record<string, unknown> =>
 
 /** Project a client's effective user registration without modifying its source files. */
 export const effectiveClientConfiguration = (
-  documents: readonly ClientConfigurationDocument[],
+  sources: readonly ClientConfigurationSource[],
+  target?: {
+    readonly client: Pick<SetupClient, "configPath" | "configPaths">;
+    readonly document: ClientConfigurationDocument | undefined;
+  },
 ): ClientConfigurationDocument | undefined => {
+  const documents =
+    target === undefined
+      ? sources
+      : (target.client.configPaths ?? [target.client.configPath]).flatMap(
+          (path) => {
+            const document =
+              path === target.client.configPath
+                ? target.document
+                : sources.find(({ sourcePath }) => sourcePath === path);
+            return document === undefined ? [] : [document];
+          },
+        );
   const last = documents.at(-1);
   if (last === undefined) return undefined;
   if (documents.length === 1) return last;
@@ -122,4 +171,48 @@ export const effectiveClientConfiguration = (
       );
   }
   return { ...last, servers, legacyServers: {} };
+};
+
+/** Read the configuration ZCode will load, preserving its same-scope fallback rule. */
+export const readEffectiveClientRegistrationConfiguration = async (
+  client: SetupClient,
+  resources?: ArtifactResourceScope,
+): Promise<
+  Result<
+    {
+      readonly document: ClientConfigurationDocument | undefined;
+      readonly configPath: string;
+    },
+    ClientConfigurationFileError
+  >
+> => {
+  const nativeSources = await readClientConfigurationFiles(client, resources);
+  if (!nativeSources.ok) return nativeSources;
+  const nativeDocument = effectiveClientConfiguration(nativeSources.value);
+  const fallbackPath =
+    client.format === "zcode" ? client.zcodeFallbackPath : undefined;
+  if (
+    fallbackPath === undefined ||
+    (nativeDocument !== undefined &&
+      Object.keys(nativeDocument.servers).length > 0)
+  )
+    return ok({ document: nativeDocument, configPath: client.configPath });
+
+  const fallbackClient: SetupClient = {
+    ...client,
+    configPath: fallbackPath,
+    configPaths: [fallbackPath],
+    format: "zcode_fallback",
+  };
+  const fallbackSources = await readClientConfigurationFiles(
+    fallbackClient,
+    resources,
+  );
+  if (!fallbackSources.ok) return fallbackSources;
+  const fallbackDocument = effectiveClientConfiguration(fallbackSources.value);
+  return ok(
+    fallbackDocument === undefined
+      ? { document: nativeDocument, configPath: client.configPath }
+      : { document: fallbackDocument, configPath: fallbackPath },
+  );
 };

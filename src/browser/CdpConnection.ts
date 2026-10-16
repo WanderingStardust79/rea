@@ -4,7 +4,7 @@ import { AnalysisCancelledError } from "../domain/analysisErrorCore.js";
 import { AnalysisError } from "../domain/analysisErrorBase.js";
 import { BrowserObservationError } from "../domain/browserObservationError.js";
 import { CdpCommandRejection } from "./CdpCommandRejection.js";
-import { type BrowserObservationOperation } from "../domain/browserObservationErrors.js";
+import type { BrowserObservationOperation } from "../domain/browserObservationErrors.js";
 import { safeParseJson } from "../domain/safeJson.js";
 import { WEB_RUNTIME_LIMITS } from "../domain/webRuntime.js";
 
@@ -243,9 +243,9 @@ export class CdpConnection {
     const hasResult = "result" in message;
     const hasError = "error" in message;
     if (
-      ("sessionId" in message &&
-        (typeof message.sessionId !== "string" ||
-          message.sessionId !== pending.sessionId)) ||
+      (pending.sessionId === undefined
+        ? "sessionId" in message
+        : message.sessionId !== pending.sessionId) ||
       hasResult === hasError
     ) {
       this.#failPending("protocol_error");

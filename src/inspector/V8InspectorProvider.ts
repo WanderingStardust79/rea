@@ -15,7 +15,7 @@ import { AnalysisError } from "../domain/analysisErrorBase.js";
 import { BrowserObservationError } from "../domain/browserObservationError.js";
 import type { AnalysisPartialObservation } from "../domain/analysisErrorBase.js";
 import { ProviderAdapterError } from "../domain/providerAdapterError.js";
-import { type BrowserObservationOperation } from "../domain/browserObservationErrors.js";
+import type { BrowserObservationOperation } from "../domain/browserObservationErrors.js";
 import { err, ok, type Result } from "../domain/result.js";
 import {
   numberValue,
@@ -94,6 +94,7 @@ export class V8InspectorProvider implements JavaScriptRuntimeObservationPort {
       );
       const allowed: AuthorizedV8InspectorTarget[] = [];
       const excluded = createInspectorExclusionCounts();
+      let unconnectable = 0;
       for (const target of discovery.targets) {
         const decision = await authorizeRuntimeTargetLocation(target.url, {
           type: target.type,
@@ -107,7 +108,18 @@ export class V8InspectorProvider implements JavaScriptRuntimeObservationPort {
           excluded.unsupported_location += 1;
           continue;
         }
-        allowed.push({ ...target, location: decision.location });
+        if (target.webSocketUrl === null) {
+          unconnectable += 1;
+          continue;
+        }
+        allowed.push({
+          id: target.id,
+          type: target.type,
+          url: target.url,
+          attached: target.attached,
+          webSocketUrl: target.webSocketUrl,
+          location: decision.location,
+        });
       }
       allowed.sort((left, right) =>
         left.id < right.id ? -1 : left.id > right.id ? 1 : 0,
@@ -116,8 +128,10 @@ export class V8InspectorProvider implements JavaScriptRuntimeObservationPort {
         javascriptRuntimeTargetListSchema.parse({
           runtime: discovery.runtime,
           targets: allowed.map(projectTarget),
-          excluded: { ...excluded, unconnectable: 0 },
-          limitations: describeInspectorTargetLimitations(),
+          excluded: { ...excluded, unconnectable },
+          limitations: describeInspectorTargetLimitations(
+            allowed.some((target) => target.attached === null),
+          ),
         }),
       );
     } catch (cause: unknown) {
@@ -357,7 +371,7 @@ const authorizedTarget = async (
     product,
   });
   if (
-    target.attached ||
+    target.attached === true ||
     !decision.allowed ||
     decision.location.kind === "builtin"
   )
@@ -365,7 +379,23 @@ const authorizedTarget = async (
       "observe_javascript_runtime",
       "target_not_allowed",
     );
-  return { ...target, location: decision.location };
+  if (target.webSocketUrl === null)
+    throw new BrowserObservationError(
+      "observe_javascript_runtime",
+      "invalid_endpoint_response",
+      {
+        detail:
+          "The selected Inspector target has no validated direct WebSocket endpoint.",
+      },
+    );
+  return {
+    id: target.id,
+    type: target.type,
+    url: target.url,
+    attached: target.attached,
+    webSocketUrl: target.webSocketUrl,
+    location: decision.location,
+  };
 };
 
 const assertRuntimeKind = (
@@ -513,20 +543,35 @@ const waitForCapture = async (
   signal?: AbortSignal,
 ): Promise<void> => {
   let removeDisconnect = (): void => undefined;
+  let removeProtocolFailure = (): void => undefined;
   const disconnected = new Promise<never>((_resolve, reject) => {
     removeDisconnect = connection.onDisconnect((error) => reject(error));
   });
+  const protocolFailure = new Promise<never>((_resolve, reject) => {
+    removeProtocolFailure = connection.onProtocolFailure((error) =>
+      reject(error),
+    );
+  });
+  const timerOwner = new AbortController();
+  const timerSignal =
+    signal === undefined
+      ? timerOwner.signal
+      : AbortSignal.any([signal, timerOwner.signal]);
   try {
     await Promise.race([
       delayWithCancellation(
         observationMs,
         "observe_javascript_runtime",
-        signal,
+        timerSignal,
       ),
       disconnected,
+      protocolFailure,
     ]);
   } finally {
+    // Cancel only this wait's timer. The caller owns and retains its signal.
+    timerOwner.abort();
     removeDisconnect();
+    removeProtocolFailure();
   }
 };
 

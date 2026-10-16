@@ -21,14 +21,19 @@ import { SUPPORTED_GHIDRA_VERSION } from "../dist/ghidra/GhidraInstallationPolic
 import { GhidraHeadlessLauncher } from "../dist/ghidra/GhidraLauncher.js";
 import { GHIDRA_PROVIDER_IDENTITY } from "../dist/ghidra/GhidraProviderCapabilities.js";
 import { windowsP0Capabilities } from "../dist/ghidra/GhidraProviderCapabilities.js";
-import { GHIDRA_SESSION_CAPABILITIES } from "../dist/ghidra/GhidraSessionValues.js";
+import {
+  GHIDRA_MUTATING_OPERATIONS,
+  GHIDRA_SESSION_CAPABILITIES,
+} from "../dist/ghidra/GhidraSessionValues.js";
 import { parseBinaryTarget } from "../dist/application/BinaryTargetResolver.js";
 import { completeVerifierRun, createVerifierRun } from "./lib/verifier-run.mjs";
 import { verifyGhidraCompactReferences } from "./lib/real-ghidra-compact-references.mjs";
+import { verifyGhidraFileOffsets } from "./lib/real-ghidra-file-offsets.mjs";
+import { verifyWindowsGhidraByteSearch } from "./lib/ghidra-windows-byte-search.mjs";
 
 const verifierRun = createVerifierRun();
 const SESSION_CAPABILITIES = GHIDRA_SESSION_CAPABILITIES.filter(
-  (name) => name !== "annotate_native_function",
+  (name) => !GHIDRA_MUTATING_OPERATIONS.has(name),
 );
 
 if (process.platform !== "win32" || process.arch !== "x64")
@@ -211,6 +216,11 @@ try {
   });
   await inventory("search_procedures", { pattern: procedure.value });
   await inventory("search_strings", { pattern: "rea" });
+  const byteSearch = await verifyWindowsGhidraByteSearch({
+    invoke: inventory,
+    sourceBytes,
+    architecture,
+  });
 
   for (const operation of [
     "procedure_assembly",
@@ -236,16 +246,20 @@ try {
 
   const expected = [
     ...GHIDRA_INVENTORY_OPERATIONS,
-    ...GHIDRA_FUNCTION_OPERATIONS.filter(
-      (name) => name !== "annotate_native_function",
-    ),
-  ];
+    ...GHIDRA_FUNCTION_OPERATIONS,
+  ].filter((name) => !GHIDRA_MUTATING_OPERATIONS.has(name));
+  const expectedOperations = new Set(expected);
+  const missingOperations = expected.filter((name) => !observed.has(name));
+  const unexpectedOperations = [...observed].filter(
+    (name) => !expectedOperations.has(name),
+  );
   if (
-    observed.size !== expected.length ||
-    expected.some((operation) => !observed.has(operation))
+    missingOperations.length > 0 ||
+    unexpectedOperations.length > 0 ||
+    observed.size !== expectedOperations.size
   )
     throw new Error(
-      `Windows Ghidra operation proof was incomplete: ${JSON.stringify([...observed])}`,
+      `Windows Ghidra operation proof was incomplete: ${JSON.stringify({ missing: missingOperations, unexpected: unexpectedOperations })}`,
     );
 
   // The reference controls occupy the EXE fixture's additional function.
@@ -269,6 +283,7 @@ try {
     },
     transport: "authenticated-loopback-tcp",
     operations: [...observed].sort((left, right) => left.localeCompare(right)),
+    byte_search: byteSearch,
     cleanup: "complete",
     compact_references: compactReferences,
     native_controls: {
@@ -299,6 +314,11 @@ try {
 }
 if (report === undefined)
   throw new Error("Windows Ghidra report was not produced");
+report.file_offsets = await verifyGhidraFileOffsets(
+  targetPath,
+  resolve(root, "scripts", "rea.mjs"),
+  architecture === "x86" ? "0x401010" : "0x140001010",
+);
 process.stdout.write(
   `${JSON.stringify({ verifier_run: await completeVerifierRun(verifierRun), ...report })}\n`,
 );

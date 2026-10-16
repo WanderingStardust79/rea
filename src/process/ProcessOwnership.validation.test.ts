@@ -21,6 +21,40 @@ const launcher: ProcessTableEntry = {
 };
 
 describe("owned process-group cleanup validation: ownership and lineage", () => {
+  it("settles unreadable observations for Darwin processes exiting in the kernel", async () => {
+    let snapshots = 0;
+    const child = {
+      pid: 101,
+      parentPid: 100,
+      processGroupId: 100,
+      state: "?E",
+      command: "fixture-child",
+    };
+    const adapter: ProcessOwnershipHost = {
+      platform: "darwin",
+      listProcesses: () => {
+        snapshots += 1;
+        return Promise.resolve(
+          snapshots === 1
+            ? [launcher, child]
+            : snapshots === 2
+              ? [launcher, child]
+              : [launcher, { ...child, state: "Z" }],
+        );
+      },
+      environment: (pid) =>
+        pid === 100
+          ? Promise.resolve({ REA_PROCESS_RUN_ID: "run-token" })
+          : Promise.reject(new Error("sysctl_errno_22")),
+      signalGroup: vi.fn(),
+    };
+
+    await expect(cleanupOwnedProcessGroup(ownership, adapter)).resolves.toEqual(
+      { cleaned: true, signaled: true },
+    );
+    expect(snapshots).toBeGreaterThanOrEqual(3);
+  });
+
   it("fails closed when a descendant in another process group lacks the token", async () => {
     const adapter: ProcessOwnershipHost = {
       listProcesses: () =>
@@ -74,7 +108,7 @@ describe("owned process-group cleanup validation: ownership and lineage", () => 
     });
     expect(await cleanupOwnedProcessGroup(ownership, adapter)).toEqual({
       cleaned: false,
-      reason: "process tree contains an unowned or PID-reused process",
+      reason: "process ownership token mismatch for PID(s): 101",
       failures: [{ pid: 101, reason: "run-token-mismatch" }],
     });
     expect(signalGroup).not.toHaveBeenCalled();
@@ -106,7 +140,7 @@ describe("owned process-group cleanup validation: ownership and lineage", () => 
     };
     expect(await cleanupOwnedProcessGroup(ownership, adapter)).toEqual({
       cleaned: false,
-      reason: "process tree contains an unowned or PID-reused process",
+      reason: "process ownership token mismatch for PID(s): 101",
       failures: [
         expect.objectContaining({
           pid: 100,
@@ -189,7 +223,7 @@ describe("owned process-group cleanup liveness rechecks", () => {
         cleanupOwnedProcessGroup(ownership, adapter),
       ).resolves.toEqual({
         cleaned: false,
-        reason: "process tree contains an unowned or PID-reused process",
+        reason: "process ownership token mismatch for PID(s): 101",
         failures: recheckFails
           ? [
               {
@@ -345,7 +379,7 @@ describe("owned process-group cleanup validation: launcher exit races", () => {
         if (remaining === "foreign")
           expect(result).toMatchObject({
             cleaned: false,
-            reason: "process tree contains an unowned or PID-reused process",
+            reason: "process ownership token mismatch for PID(s): 101",
           });
         else
           expect(result).toEqual({

@@ -5,14 +5,23 @@ import type { StableRegularFileDescriptor } from "../../filesystem/RegularFile.j
 import type { OwnedFileHandle } from "../../filesystem/OwnedFileHandle.js";
 
 import { classifyArtifactContent } from "./ArtifactGraphConstruction.js";
-import { ARTIFACT_CLASSIFICATION_PREFIX_BYTES } from "../ArtifactHash.js";
+import {
+  abortIfNeeded,
+  ARTIFACT_CLASSIFICATION_PREFIX_BYTES,
+} from "../ArtifactHash.js";
+import {
+  createXmlPlistSignatureProbe,
+  MAX_XML_PLIST_PROBE_BYTES,
+} from "../../domain/apple/appleArchiveFormat.js";
 import type { ArtifactOccurrence } from "../../domain/artifactGraph.js";
 import {
   hasZipSignature,
+  isZipPackageFormat,
   zipPackageFormatForPath,
+  type ZipPackageFormat,
 } from "../../domain/zipPackageFormat.js";
 import { ArtifactReaderFailure } from "../ArtifactReader.js";
-import { type ArtifactResourceOwner } from "../ArtifactResourceScope.js";
+import type { ArtifactResourceOwner } from "../ArtifactResourceScope.js";
 import type { HashResult } from "../ArtifactHash.js";
 import {
   hashStableRootArtifactHandle,
@@ -102,14 +111,15 @@ export const classifyAndHashRootForInventory = async (
         "integrity",
         `Root artifact changed before inventory: ${path}`,
       );
-    const format = await classifyRootFormat(path, handle);
+    const format = await classifyRootFormat(path, handle, options.signal);
     const digest = await hashStableRootArtifactHandle(
       path,
       handle,
       initial,
       options.signal,
     );
-    const retainSource = isZipFormat(format) || format === "mach-o-universal";
+    const retainSource =
+      isZipPackageFormat(format) || format === "mach-o-universal";
     outcome = {
       kind: "completed",
       value: {
@@ -138,37 +148,58 @@ export const classifyAndHashRootForInventory = async (
   return outcome.value;
 };
 
-const isZipFormat = (format: ArtifactOccurrence["artifact_format"]): boolean =>
-  format === "zip" ||
-  format === "ipa" ||
-  format === "apk" ||
-  format === "msix" ||
-  format === "appx";
-
 const classifyRootFormat = async (
   path: string,
   handle: FileHandle,
+  signal?: AbortSignal,
 ): Promise<ArtifactOccurrence["artifact_format"]> => {
   const magic = Buffer.alloc(ARTIFACT_CLASSIFICATION_PREFIX_BYTES);
   const observed = await handle.read(magic, 0, magic.length, 0);
-  const prefix = magic.subarray(0, observed.bytesRead);
+  let prefix = magic.subarray(0, observed.bytesRead);
   const lower = path.toLowerCase();
-  if (hasZipSignature(prefix)) return zipPackageFormatForPath(lower) ?? "zip";
+  if (hasZipSignature(prefix)) return zipRootPackageFormat(lower);
   if (
     lower.endsWith(".pkg") &&
-    prefix.subarray(0, 4).toString("ascii") === "xar!"
+    prefix.subarray(0, 4).equals(Buffer.from("xar!"))
   )
     return "pkg";
   if (lower.endsWith(".dmg") && (await hasKolyTrailer(handle))) return "dmg";
+  const xmlProbe = createXmlPlistSignatureProbe();
+  xmlProbe.write(prefix);
+  const chunks = [prefix];
+  let prefixBytes = prefix.length;
+  while (
+    xmlProbe.state === "pending" &&
+    prefixBytes < MAX_XML_PLIST_PROBE_BYTES
+  ) {
+    abortIfNeeded(signal);
+    const chunk = Buffer.alloc(
+      Math.min(64 * 1024, MAX_XML_PLIST_PROBE_BYTES - prefixBytes),
+    );
+    const read = await handle.read(chunk, 0, chunk.length, prefixBytes);
+    abortIfNeeded(signal);
+    if (read.bytesRead === 0) break;
+    const selected = chunk.subarray(0, read.bytesRead);
+    chunks.push(selected);
+    prefixBytes += selected.length;
+    xmlProbe.write(selected);
+  }
+  prefix = Buffer.concat(chunks);
   // ASAR is chosen from its header pickle; any other suffix is a role hint.
   return classifyArtifactContent(path, prefix, (await handle.stat()).size)
     .format;
 };
+
+/** App Pack is a verified ZIP root role; nested .app members retain their observed format. */
+const zipRootPackageFormat = (lower: string): ZipPackageFormat =>
+  lower.endsWith(".app")
+    ? "app-pack"
+    : (zipPackageFormatForPath(lower) ?? "zip");
 
 const hasKolyTrailer = async (handle: FileHandle): Promise<boolean> => {
   const size = (await handle.stat()).size;
   if (size < 512) return false;
   const trailer = Buffer.alloc(4);
   const read = await handle.read(trailer, 0, trailer.length, size - 512);
-  return read.bytesRead === 4 && trailer.toString("ascii") === "koly";
+  return read.bytesRead === 4 && trailer.equals(Buffer.from("koly"));
 };

@@ -27,7 +27,17 @@ import { range } from "./javascriptStaticAnalysisHelpers.js";
 import {
   propertyName,
   semanticStaticPropertyKey,
+  semanticWrappedWriteSite,
+  semanticWriteSiteReadsFirst,
+  semanticWriteSiteTarget,
+  unwrapJavaScriptExpression,
 } from "./javascriptAstValues.js";
+import {
+  isTypeOnlyExportDeclaration,
+  isTypeOnlyExportSpecifier,
+  isTypeOnlyImportDeclaration,
+  isTypeOnlyImportSpecifier,
+} from "./javascriptModuleDeclaration.js";
 
 interface CollectCallableInput {
   readonly node: t.Node;
@@ -69,12 +79,13 @@ export const collectSemanticModuleLink = (
   node: t.Node,
   state: JavaScriptSemanticAnalysisState,
 ): void => {
-  if (t.isImportDeclaration(node)) collectImports(node, state);
+  if (t.isTSImportEqualsDeclaration(node)) collectImportEquals(node, state);
+  else if (t.isImportDeclaration(node)) collectImports(node, state);
   else if (t.isExportAllDeclaration(node))
     addModuleLink(
       state,
       {
-        kind: "re-export",
+        kind: isTypeOnlyExportDeclaration(node) ? "type-import" : "re-export",
         specifier: node.source.value,
         importedName: "*",
         localName: null,
@@ -91,7 +102,7 @@ export const collectSemanticModuleLink = (
         kind: "export",
         specifier: null,
         importedName: null,
-        localName: defaultDeclarationName(node.declaration),
+        localName: defaultExportLocalName(node.declaration),
         exportedName: "default",
         callableId: semanticCallableIdForNode(node.declaration),
         location: range(node),
@@ -100,7 +111,45 @@ export const collectSemanticModuleLink = (
     );
   else if (t.isVariableDeclarator(node)) collectRequireLink(node, state);
   else if (t.isAssignmentExpression(node)) collectCommonJsExport(node, state);
+  else if (t.isCallExpression(node)) collectUnboundRequireLink(node, state);
 };
+
+const collectImportEquals = (
+  node: t.TSImportEqualsDeclaration,
+  state: JavaScriptSemanticAnalysisState,
+): void => {
+  const moduleReference = node.moduleReference;
+  const specifier =
+    semanticImportEqualsSpecifier(node) ??
+    (node.importKind === "type" &&
+    t.isTSExternalModuleReference(moduleReference) &&
+    t.isStringLiteral(moduleReference.expression)
+      ? moduleReference.expression.value
+      : null);
+  if (specifier === null) return;
+  addModuleLink(
+    state,
+    {
+      kind: node.importKind === "type" ? "type-import" : "require",
+      specifier,
+      importedName: null,
+      localName: node.id.name,
+      exportedName: null,
+      location: range(node),
+    },
+    node,
+  );
+};
+
+/** Runtime external-module target for a value import-equals declaration. */
+export const semanticImportEqualsSpecifier = (
+  node: t.TSImportEqualsDeclaration,
+): string | null =>
+  node.importKind !== "type" &&
+  t.isTSExternalModuleReference(node.moduleReference) &&
+  t.isStringLiteral(node.moduleReference.expression)
+    ? node.moduleReference.expression.value
+    : null;
 
 /** Collect lexical references after definitions exist, optionally for one name. */
 export const collectSemanticReferences = (
@@ -130,12 +179,17 @@ export function* collectSemanticReferencesSteps(
           !patterns.some((pattern) => bindsIdentifier(pattern, parent, node)))
       )
         return;
-      const role = semanticIdentifierRole(node, parent, readAncestors());
+      const ancestors = readAncestors();
+      const role = semanticIdentifierRole(node, parent, ancestors);
       if (role === null) return;
       // A compound assignment or update reads before it writes; emit both so
       // reference consumers see the read they actually execute.
       const roles =
-        role === "write" && semanticReadsBeforeWrite(node, parent)
+        role === "write" &&
+        semanticReadsBeforeWrite(
+          node,
+          semanticWrappedWriteSite(node, parent, ancestors) ?? parent,
+        )
           ? (["read", "write"] as const)
           : ([role] as const);
       for (const resolvedRole of roles) {
@@ -255,7 +309,7 @@ const collectImports = (
     addModuleLink(
       state,
       {
-        kind: "import",
+        kind: isTypeOnlyImportDeclaration(node) ? "type-import" : "import",
         specifier: node.source.value,
         importedName: null,
         localName: null,
@@ -268,7 +322,12 @@ const collectImports = (
     addModuleLink(
       state,
       {
-        kind: "import",
+        kind:
+          isTypeOnlyImportDeclaration(node) ||
+          (t.isImportSpecifier(specifier) &&
+            isTypeOnlyImportSpecifier(specifier))
+            ? "type-import"
+            : "import",
         specifier: node.source.value,
         importedName: t.isImportDefaultSpecifier(specifier)
           ? "default"
@@ -287,12 +346,13 @@ const collectNamedExports = (
   node: t.ExportNamedDeclaration,
   state: JavaScriptSemanticAnalysisState,
 ): void => {
+  const declarationTypeOnly = isTypeOnlyExportDeclaration(node);
   if (node.declaration !== null && node.declaration !== undefined)
     for (const localName of declarationNames(node.declaration))
       addModuleLink(
         state,
         {
-          kind: "export",
+          kind: declarationTypeOnly ? "type-import" : "export",
           specifier: null,
           importedName: null,
           localName,
@@ -303,14 +363,29 @@ const collectNamedExports = (
         node,
       );
   for (const specifier of node.specifiers)
-    if (t.isExportSpecifier(specifier))
+    if (
+      t.isExportSpecifier(specifier) ||
+      (t.isExportNamespaceSpecifier(specifier) && node.exportKind !== "type")
+    )
       addModuleLink(
         state,
         {
-          kind: node.source == null ? "export" : "re-export",
+          kind:
+            declarationTypeOnly ||
+            (t.isExportSpecifier(specifier) &&
+              isTypeOnlyExportSpecifier(specifier))
+              ? "type-import"
+              : node.source == null
+                ? "export"
+                : "re-export",
           specifier: node.source?.value ?? null,
-          importedName: propertyName(specifier.local),
-          localName: node.source == null ? propertyName(specifier.local) : null,
+          importedName: t.isExportNamespaceSpecifier(specifier)
+            ? "*"
+            : propertyName(specifier.local),
+          localName:
+            node.source == null && t.isExportSpecifier(specifier)
+              ? propertyName(specifier.local)
+              : null,
           exportedName: propertyName(specifier.exported),
           location: range(specifier),
         },
@@ -322,9 +397,11 @@ const collectRequireLink = (
   node: t.VariableDeclarator,
   state: JavaScriptSemanticAnalysisState,
 ): void => {
-  const origin = semanticRequireOrigin(node.init, state);
-  if (origin === undefined) return;
-  for (const binding of requirePatternBindings(node.id, origin.importedPath))
+  const required = semanticRequireOrigin(node.init, state);
+  if (required === undefined) return;
+  const { origin, call } = required;
+  const bindings = requirePatternBindings(node.id, origin.importedPath);
+  for (const binding of bindings)
     addModuleLink(
       state,
       {
@@ -337,6 +414,29 @@ const collectRequireLink = (
       },
       node,
     );
+  if (bindings.length > 0) state.linkedRequireCalls.add(call);
+};
+
+const collectUnboundRequireLink = (
+  node: t.CallExpression,
+  state: JavaScriptSemanticAnalysisState,
+): void => {
+  if (state.linkedRequireCalls.has(node)) return;
+  const required = semanticRequireOrigin(node, state);
+  if (required === undefined) return;
+  addModuleLink(
+    state,
+    {
+      kind: "require",
+      specifier: required.origin.specifier,
+      importedName: null,
+      localName: null,
+      exportedName: null,
+      location: range(node),
+    },
+    node,
+  );
+  state.linkedRequireCalls.add(node);
 };
 
 const requirePatternBindings = (
@@ -382,8 +482,9 @@ const collectCommonJsExport = (
     node.operator === "=" && receiverEffect !== "uncertain" ? node.right : null;
   while (t.isAssignmentExpression(value, { operator: "=" }))
     value = value.right;
-  const origin =
+  const required =
     value === null ? undefined : semanticRequireOrigin(value, state);
+  const origin = required?.origin;
   addModuleLink(
     state,
     {
@@ -397,6 +498,7 @@ const collectCommonJsExport = (
     },
     node,
   );
+  if (required !== undefined) state.linkedRequireCalls.add(required.call);
 };
 
 /**
@@ -440,8 +542,26 @@ const addModuleLink = (
   },
   referenceNode: t.Node,
 ): void => {
-  const collected = { ...link, callableId: link.callableId ?? null };
+  const resolutionMode =
+    link.resolutionMode ??
+    (link.kind === "import" ||
+    link.kind === "re-export" ||
+    link.kind === "type-import"
+      ? state.staticImportResolutionMode
+      : link.kind === "require"
+        ? "require"
+        : undefined);
+  const collected = {
+    ...link,
+    ...(resolutionMode === undefined ? {} : { resolutionMode }),
+    callableId: link.callableId ?? null,
+  };
   state.moduleLinks.push(collected);
+  if (
+    t.isExportDefaultDeclaration(referenceNode) &&
+    t.isExpression(referenceNode.declaration)
+  )
+    state.defaultExportExpressions.set(collected, referenceNode.declaration);
   if (link.localName !== null) {
     const binding = resolveSemanticBindingState(
       state,
@@ -488,12 +608,15 @@ const declarationCallableId = (
  */
 export const semanticReadsBeforeWrite = (
   node: t.Node,
-  parent: t.Node,
-): boolean =>
-  (t.isAssignmentExpression(parent) &&
-    parent.left === node &&
-    parent.operator !== "=") ||
-  (t.isUpdateExpression(parent) && parent.argument === node);
+  site: t.Node,
+): boolean => {
+  const target = semanticWriteSiteTarget(site);
+  return (
+    target !== null &&
+    unwrapJavaScriptExpression(target).node === node &&
+    semanticWriteSiteReadsFirst(site)
+  );
+};
 
 /**
  * Role of one identifier occurrence, given the node's ancestry.
@@ -514,6 +637,8 @@ export const semanticIdentifierRole = (
     if (isPatternOwnerDeclaration(patternAncestor)) return null;
     return "write";
   }
+  const site = semanticWrappedWriteSite(node, parent, ancestors);
+  if (site !== null && site !== parent && !isDeleteSite(site)) return "write";
   return semanticReferenceRole(node, parent);
 };
 
@@ -578,6 +703,9 @@ const isPatternNode = (node: t.Node): boolean =>
   t.isAssignmentPattern(node) ||
   t.isRestElement(node);
 
+const isDeleteSite = (site: t.Node): boolean =>
+  t.isUnaryExpression(site, { operator: "delete" });
+
 const isPatternOwnerDeclaration = (node: t.Node): boolean =>
   (t.isVariableDeclarator(node) && t.isPattern(node.id)) ||
   (t.isFunction(node) &&
@@ -602,19 +730,26 @@ export const semanticReferenceRole = (
   return "read";
 };
 
-const isDeclarationIdentifier = (node: t.Identifier, parent: t.Node): boolean =>
-  (t.isVariableDeclarator(parent) && patternContains(parent.id, node)) ||
-  ((t.isFunctionDeclaration(parent) || t.isFunctionExpression(parent)) &&
-    parent.id === node) ||
-  (t.isFunction(parent) &&
-    parent.params.some((value) => patternContains(value, node))) ||
-  ((t.isClassDeclaration(parent) || t.isClassExpression(parent)) &&
-    parent.id === node) ||
-  (t.isImportSpecifier(parent) &&
-    (parent.local === node || parent.imported === node)) ||
-  (t.isImportDefaultSpecifier(parent) && parent.local === node) ||
-  (t.isImportNamespaceSpecifier(parent) && parent.local === node) ||
-  (t.isCatchClause(parent) && parent.param === node);
+const isDeclarationIdentifier = (
+  node: t.Identifier,
+  parent: t.Node,
+): boolean => {
+  if (t.isTSImportEqualsDeclaration(parent)) return parent.id === node;
+  return (
+    (t.isVariableDeclarator(parent) && patternContains(parent.id, node)) ||
+    ((t.isFunctionDeclaration(parent) || t.isFunctionExpression(parent)) &&
+      parent.id === node) ||
+    (t.isFunction(parent) &&
+      parent.params.some((value) => patternContains(value, node))) ||
+    ((t.isClassDeclaration(parent) || t.isClassExpression(parent)) &&
+      parent.id === node) ||
+    (t.isImportSpecifier(parent) &&
+      (parent.local === node || parent.imported === node)) ||
+    (t.isImportDefaultSpecifier(parent) && parent.local === node) ||
+    (t.isImportNamespaceSpecifier(parent) && parent.local === node) ||
+    (t.isCatchClause(parent) && parent.param === node)
+  );
+};
 
 const isNonReferenceKey = (node: t.Identifier, parent: t.Node): boolean =>
   ((t.isMemberExpression(parent) || t.isOptionalMemberExpression(parent)) &&
@@ -671,16 +806,31 @@ const declarationNames = (declaration: t.Declaration): string[] => {
     t.isIdentifier(declaration.id)
   )
     return [declaration.id.name];
+  if (
+    (t.isTSInterfaceDeclaration(declaration) ||
+      t.isTSTypeAliasDeclaration(declaration) ||
+      t.isTSDeclareFunction(declaration)) &&
+    t.isIdentifier(declaration.id)
+  )
+    return [declaration.id.name];
+  if (
+    t.isTSImportEqualsDeclaration(declaration) &&
+    semanticImportEqualsSpecifier(declaration) !== null
+  )
+    return [declaration.id.name];
   return [];
 };
 
-const defaultDeclarationName = (
+const defaultExportLocalName = (
   declaration: t.ExportDefaultDeclaration["declaration"],
-): string | null =>
-  (t.isFunctionDeclaration(declaration) || t.isClassDeclaration(declaration)) &&
-  t.isIdentifier(declaration.id)
-    ? declaration.id.name
+): string | null => {
+  const value = unwrapJavaScriptExpression(declaration).node;
+  if (t.isIdentifier(value)) return value.name;
+  return (t.isFunctionDeclaration(value) || t.isClassDeclaration(value)) &&
+    t.isIdentifier(value.id)
+    ? value.id.name
     : null;
+};
 
 const commonJsExportName = (
   node: t.Node,
@@ -690,16 +840,15 @@ const commonJsExportName = (
   if (!t.isMemberExpression(node) && !t.isOptionalMemberExpression(node))
     return undefined;
   const key = semanticStaticPropertyKey(node.property, node.computed);
-  // `exports[key]`/`module.exports[key]` assign an export whose name is not
-  // knowable. Report the wildcard rather than the variable name, and never
-  // collapse it into `default`, which would claim a real default export.
+  // A computed nonliteral key is unknown, but the empty string is a real exact
+  // CommonJS export name and must not collapse into the wildcard/default.
   if (isUnshadowedGlobal(node.object, state, "exports"))
-    return key === null ? "*" : key || "*";
+    return key === null ? "*" : key;
   if (
     t.isMemberExpression(node.object) &&
     isCommonJsModuleExports(node.object, state)
   )
-    return key === null ? "*" : key || "default";
+    return key === null ? "*" : key;
   if (isCommonJsModuleExports(node, state)) return "default";
   return undefined;
 };

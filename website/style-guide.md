@@ -26,6 +26,13 @@ fold. Keep the main path short and let readers open the supporting details.
 
 ## Write the task directly
 
+Write the English source first. Keep translated wording just as concrete: a
+reader should understand the question, the evidence and the next action without
+decoding a literal translation. Preserve commands, code and recorded values.
+Read a whole example together when reviewing its translation. Check headings,
+figures and interactive labels at phone widths, including right-to-left editions.
+The [translation guide](locales/README.md) explains the catalogs and update process.
+
 Name the software, behavior or action in headings. Give the opening paragraph
 one job: explain what the page covers. Use concrete verbs such as install, trace,
 read, compare and calculate.
@@ -82,13 +89,26 @@ Give long pages a short table of contents with concrete section names. Preserve
 the reading width: the homepage uses the side gutter when it has room,
 and a collapsible sticky menu on smaller screens. Highlight the current
 section, keep fragment links usable without JavaScript, and leave room above
-the destination for the sticky control. Offer experienced readers a direct
-route from setup to the analysis guides. Keep full case-study previews on the
-Showcases page, linked from the opening actions.
-Use short labels, selective bold text and the shared blue highlight to make
-those facts visible when scanning. Keep source, interpretation and new code
-attributed to their respective roles. On mobile, the demo can precede its
-supporting code once its purpose is clear.
+the destination for the sticky control. Make Get started the primary opening
+action. Keep short Showcases and Blog descriptions below the opening actions,
+with the original equal-width introduction and setup columns on desktop.
+Use a short introduction and one three-step overview before the examples.
+Let introductory prose wrap naturally across the container, independently of
+the narrower heading width. Add a brief transition before the worked examples.
+Present each example in the same reading order: the question, the rule found
+in the program, then a reconstruction to try. Use plain language in that path;
+keep original code, source details and verification in the disclosure below it.
+Prefer ordinary paragraphs to repeated goal, finding and role panels. Reserve
+bold text and blue highlights for a meaningful code selection or action, not
+every takeaway. Keep source, interpretation and new code attributed to their
+respective roles. On mobile, the demo can precede its supporting code once its
+purpose is clear. Put the detailed manual/agent comparison and verification
+flows in native disclosures so the main reading path stays compact. Retain the
+authored examples, source excerpts, investigation steps and useful prompts when
+reordering the page. Opening an investigation should reveal its explanation
+and code without another layer of hidden analysis.
+Keep FAQ, community help and issue reports on separate lines. Describe what
+each destination is for so readers can choose the right one.
 Show how the reader's task changes using the same question on both sides of a
 manual/agent comparison. Let returned evidence make REA's contribution visible.
 When showing manual analysis, use authentic instructions and specific analyst
@@ -212,14 +232,28 @@ display size; scaling small labels down is not a mobile layout.
 
 The shared stylesheet defines the site. Its core colors are:
 
-| Token      | Value     | Use                              |
-| ---------- | --------- | -------------------------------- |
-| `--page`   | `#ffffff` | Page background                  |
-| `--ink`    | `#20252b` | Main text                        |
-| `--muted`  | `#5b6570` | Secondary text                   |
-| `--line`   | `#e0e5e9` | Section and component boundaries |
-| `--soft`   | `#f4f6f8` | Code and supporting surfaces     |
-| `--accent` | `#294f82` | Links and meaningful highlights  |
+| Token      | Light     | Dark      | Use                              |
+| ---------- | --------- | --------- | -------------------------------- |
+| `--page`   | `#ffffff` | `#1e1e2e` | Page background                  |
+| `--ink`    | `#20252b` | `#cdd6f4` | Main text                        |
+| `--muted`  | `#5b6570` | `#a6adc8` | Secondary text                   |
+| `--line`   | `#e0e5e9` | `#45475a` | Section and component boundaries |
+| `--soft`   | `#f4f6f8` | `#181825` | Code and supporting surfaces     |
+| `--accent` | `#294f82` | `#89b4fa` | Links and meaningful highlights  |
+
+The header's sun/moon button switches between light and dark. On the first visit,
+the site follows the system preference; a manual choice is saved for later visits
+and shared across pages and languages on that host. Without JavaScript, the site
+uses the light palette and hides the switch.
+
+`assets/theme.js` applies the choice before styles load and owns theme changes.
+The stylesheet scopes the dark palette to `data-theme="dark"` on the root,
+using [Catppuccin Mocha](https://github.com/catppuccin/palette) colors (MIT).
+Any new fixed color needs a dark counterpart in that section. Keep selector
+specificity unchanged with `:where()` when scoping component rules.
+Embedded SVGs inherit the page's `color-scheme`; canvas demos listen for
+`website-theme-change` to redraw. Check both themes, including a manual choice
+that differs from the system preference.
 
 Use the system sans-serif stack for prose and the shared monospace stack for
 code. The current container is at most 1080px wide, with article text limited to

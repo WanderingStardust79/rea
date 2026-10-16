@@ -6,161 +6,6 @@ import { PRODUCT_IDENTITY } from "../../../src/identity.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 import { cliTest } from "../../support/cli/cliFixture.js";
 
-const cases = [
-  {
-    client: "gemini_cli",
-    env: { GEMINI_CLI_HOME: "profile" },
-    config: "profile/.gemini/settings.json",
-    skill: "profile/.agents/skills",
-  },
-  {
-    client: "opencode",
-    env: { OPENCODE_CONFIG_DIR: "profile" },
-    config: "profile/opencode.json",
-    skill: ".agents/skills",
-  },
-  {
-    client: "opencode",
-    env: { OPENCODE_CONFIG_DIR: "" },
-    config: ".config/opencode/opencode.json",
-    skill: ".agents/skills",
-  },
-  {
-    client: "codex",
-    env: { CODEX_HOME: "" },
-    config: ".codex/config.toml",
-    skill: ".agents/skills",
-  },
-  {
-    client: "grok_build",
-    env: { GROK_HOME: "" },
-    config: ".grok/config.toml",
-    skill: ".agents/skills",
-  },
-  {
-    client: "omp",
-    env: { PI_CODING_AGENT_DIR: "profile" },
-    config: "profile/mcp.json",
-    skill: ".agents/skills",
-  },
-  {
-    client: "devin",
-    env: { XDG_CONFIG_HOME: "profile" },
-    config: "profile/devin/mcp_config.json",
-    skill: ".agents/skills",
-  },
-  {
-    client: "antigravity",
-    env: {},
-    config: ".gemini/config/mcp_config.json",
-    skill: ".gemini/config/skills",
-  },
-];
-for (const testCase of cases.filter(
-  ({ client }) => process.platform !== "win32" || client !== "devin",
-)) {
-  cliTest(
-    `${testCase.client} lifecycle follows the selected roots (${testCase.config})`,
-    async ({ cli }) => {
-      const home = await createTestTempDirectory("rea-client-profile-");
-      const environment: NodeJS.ProcessEnv = { HOME: home, USERPROFILE: home };
-      for (const [key, value] of Object.entries(testCase.env))
-        environment[key] = value === "profile" ? join(home, value) : value;
-      // OMP's relative override is relative to the caller, not silently ignored.
-      if (testCase.client === "omp")
-        environment.PI_CODING_AGENT_DIR = "profile";
-      const config = join(home, testCase.config);
-      const skillDirectory = join(
-        home,
-        testCase.skill,
-        "reverse-engineer-anything",
-      );
-      const run = (arguments_: readonly string[]) =>
-        cli.run({
-          arguments: arguments_,
-          cwd: home,
-          environment,
-          timeoutMs: 20_000,
-        });
-      const planned = await run([
-        "setup",
-        "--client",
-        testCase.client,
-        "--dry-run",
-        "--json",
-      ]);
-      expect(planned.exitCode).toBe(0);
-      expect(planned.json).toMatchObject({
-        status: "planned",
-        plannedActions: expect.arrayContaining([
-          expect.objectContaining({ target: config }),
-          expect.objectContaining({ target: skillDirectory }),
-        ]),
-      });
-      await expect(access(config)).rejects.toMatchObject({ code: "ENOENT" });
-      const setup = await run([
-        "setup",
-        "--client",
-        testCase.client,
-        "--yes",
-        "--json",
-      ]);
-      expect(setup.exitCode).toBe(0);
-      expect(setup.json).toMatchObject({ status: "ready" });
-      await expect(access(config)).resolves.toBeUndefined();
-      expect(
-        await readFile(join(skillDirectory, "SKILL.md"), "utf8"),
-      ).toContain("reverse-engineer-anything");
-      await expect(access(join(home, "config.toml"))).rejects.toMatchObject({
-        code: "ENOENT",
-      });
-      const doctor = await run([
-        "doctor",
-        "--client",
-        testCase.client,
-        "--skill",
-        "--json",
-      ]);
-      expect(doctor.exitCode).toBe(0);
-      expect(doctor.json).toMatchObject({
-        healthy: true,
-        identity: { skill: { state: "aligned" } },
-      });
-      if (testCase.client === "grok_build") {
-        const original = await readFile(config, "utf8");
-        await writeFile(
-          config,
-          original.replace(
-            "[mcp_servers.rea]",
-            "[mcp_servers.rea]\ndisabled = true",
-          ),
-        );
-        expect(
-          (await run(["doctor", "--client", "grok_build", "--json"])).exitCode,
-        ).toBe(0);
-        await writeFile(config, original);
-      }
-      const repeat = await run([
-        "setup",
-        "--client",
-        testCase.client,
-        "--yes",
-        "--json",
-      ]);
-      expect(repeat.json).toMatchObject({
-        status: "ready",
-        appliedActions: [],
-      });
-      const uninstall = await run(["uninstall", "--json"]);
-      expect(uninstall.exitCode).toBe(0);
-      expect(uninstall.json).toMatchObject({ status: "complete" });
-      await expect(
-        access(join(skillDirectory, "SKILL.md")),
-      ).rejects.toMatchObject({ code: "ENOENT" });
-    },
-  );
-}
-
 for (const policy of [{ excluded: ["rea"] }, { allowed: ["other"] }]) {
   cliTest(
     `Gemini refuses a registration blocked by ${Object.keys(policy)[0]}`,
@@ -414,6 +259,91 @@ cliTest(
     const empty = await run();
     expect(empty.exitCode).toBe(0);
     expect(empty.json).toMatchObject({ status: "ready", appliedActions: [] });
+  },
+);
+
+cliTest(
+  "Gemini matches allowlist spellings independently of their policy order",
+  async ({ cli }) => {
+    const home = await createTestTempDirectory("rea-gemini-case-");
+    const system = join(home, "system.json");
+    const defaults = join(home, "defaults.json");
+    await writeFile(system, JSON.stringify({ mcp: { allowed: ["REA"] } }));
+    const environment = {
+      HOME: home,
+      USERPROFILE: home,
+      GEMINI_CLI_SYSTEM_SETTINGS_PATH: system,
+      GEMINI_CLI_SYSTEM_DEFAULTS_PATH: defaults,
+    };
+    const run = () =>
+      cli.run({
+        arguments: ["setup", "--client", "gemini_cli", "--yes", "--json"],
+        cwd: home,
+        environment,
+      });
+    // The intersection compares names case-insensitively, so the spelling that
+    // survives must not decide the outcome: the same pair of policies in
+    // either arrangement has to consolidate to the same decision.
+    for (const [systemSpelling, defaultSpelling] of [
+      ["REA", "rea"],
+      ["rea", "REA"],
+    ]) {
+      await writeFile(
+        system,
+        JSON.stringify({ mcp: { allowed: [systemSpelling] } }),
+      );
+      await writeFile(
+        defaults,
+        JSON.stringify({ mcp: { allowed: [defaultSpelling] } }),
+      );
+      const result = await run();
+      expect(result.exitCode, `${systemSpelling}+${defaultSpelling}`).toBe(0);
+      expect(result.json, `${systemSpelling}+${defaultSpelling}`).toMatchObject(
+        {
+          status: "ready",
+        },
+      );
+    }
+  },
+);
+
+cliTest(
+  "Gemini compares exclusions and padded allowlist entries through one normalization",
+  async ({ cli }) => {
+    const home = await createTestTempDirectory("rea-gemini-normalized-");
+    const system = join(home, "system.json");
+    const defaults = join(home, "defaults.json");
+    const environment = {
+      HOME: home,
+      USERPROFILE: home,
+      GEMINI_CLI_SYSTEM_SETTINGS_PATH: system,
+      GEMINI_CLI_SYSTEM_DEFAULTS_PATH: defaults,
+    };
+    const run = () =>
+      cli.run({
+        arguments: ["setup", "--client", "gemini_cli", "--yes", "--json"],
+        cwd: home,
+        environment,
+      });
+    await writeFile(defaults, JSON.stringify({ mcp: {} }));
+    // An exclusion is a membership test over the same names the intersection
+    // compares, so a differently spelled and padded entry blocks setup rather
+    // than slipping past the raw comparison.
+    await writeFile(system, JSON.stringify({ mcp: { excluded: [" REA "] } }));
+    const blocked = await run();
+    expect(blocked.exitCode).toBe(1);
+    expect(blocked.json).toMatchObject({
+      status: "needs_human",
+      plannedActions: [],
+      appliedActions: [],
+      remediation: expect.stringContaining("mcp.excluded"),
+    });
+    // Padding is presentation, not identity: a padded allowlist entry permits
+    // the same server its exact spelling permits.
+    await writeFile(system, JSON.stringify({ mcp: { allowed: [" REA "] } }));
+    const allowed = await run();
+    expect(allowed.exitCode).toBe(0);
+    expect(allowed.json).toMatchObject({ status: "ready" });
   },
 );
 

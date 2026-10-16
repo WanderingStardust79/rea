@@ -25,6 +25,7 @@ import {
   evaluateAnalysisProviderCandidate,
   type AnalysisProviderCandidateEvaluation,
 } from "./AnalysisProviderEvaluation.js";
+import { compareUnicodeCodePoints } from "../../domain/unicodeCodePointOrder.js";
 
 /** Deterministic discovery truth for one configured deep provider. */
 export interface AnalysisProviderCandidateStatus {
@@ -49,6 +50,8 @@ export interface AnalysisProviderBinding {
   readonly identity: ProviderIdentity & { readonly version: string };
   readonly selectionSource: "request" | "environment" | "auto-single-candidate";
   readonly profile: AnalysisProfileCommitment;
+  /** The provider's capabilities, attributed to its resolved identity. */
+  readonly capabilities: readonly CapabilityDescriptor[];
 }
 
 /** Complete result used for both a bound and intentionally unbound target. */
@@ -109,12 +112,14 @@ export class AnalysisProviderRegistry {
     }
     this.#providers = Object.freeze(
       [...providers].sort((left, right) =>
-        left.identity().id.localeCompare(right.identity().id),
+        compareUnicodeCodePoints(left.identity().id, right.identity().id),
       ),
     );
     this.#byId = byId;
     this.#declaredOperations = Object.freeze(
-      [...declaredOperations].sort((left, right) => left.localeCompare(right)),
+      [...declaredOperations].sort((left, right) =>
+        compareUnicodeCodePoints(left, right),
+      ),
     );
   }
 
@@ -171,7 +176,7 @@ export class AnalysisProviderRegistry {
       return err(new AnalysisCancelledError("open_binary"));
     if (
       request === undefined &&
-      selector !== "auto" &&
+      this.#byId.has(selector) &&
       baseline.length > 0 &&
       baseline.every(
         ({ targetSupport }) => targetSupport.status === "unsupported",
@@ -301,6 +306,10 @@ export class AnalysisProviderRegistry {
         throw new TypeError("Cancelled candidate evaluation disappeared");
       return result.value;
     });
+    const cleanupFailure = evaluations.find(
+      ({ profileError }) => profileError?.cleanupIncomplete === true,
+    )?.profileError;
+    if (cleanupFailure !== undefined) return err(cleanupFailure);
     const statuses = evaluations.map(({ status }) => status);
     const usable = evaluations.filter(
       (
@@ -329,23 +338,29 @@ export class AnalysisProviderRegistry {
 const candidateStatus = (
   provider: AnalysisProviderCandidate,
   target: BinaryTarget | undefined,
-): AnalysisProviderCandidateStatus => ({
-  provider: structuredClone(provider.identity()),
-  availability: cloneAvailability(provider.inspectAvailability()),
-  targetSupport:
-    target === undefined
-      ? {
-          status: "unknown",
-          code: null,
-          reason: "No target is open.",
-          diagnostics: {},
-        }
-      : cloneTargetSupport(provider.inspectTargetSupport(target)),
-  selected: false,
-  capabilities: provider
-    .capabilities()
-    .map((capability) => structuredClone(capability)),
-});
+): AnalysisProviderCandidateStatus => {
+  const readiness = provider.inspectReadinessSnapshot?.() ?? {
+    availability: provider.inspectAvailability(),
+    capabilities: provider.capabilities(),
+  };
+  return {
+    provider: structuredClone(provider.identity()),
+    availability: cloneAvailability(readiness.availability),
+    targetSupport:
+      target === undefined
+        ? {
+            status: "unknown",
+            code: null,
+            reason: "No target is open.",
+            diagnostics: {},
+          }
+        : cloneTargetSupport(provider.inspectTargetSupport(target)),
+    selected: false,
+    capabilities: readiness.capabilities.map((capability) =>
+      structuredClone(capability),
+    ),
+  };
+};
 
 const signalIsAborted = (signal: AbortSignal | undefined): boolean =>
   signal?.aborted === true;
@@ -358,18 +373,25 @@ const selectedResult = (
   },
   statuses: readonly AnalysisProviderCandidateStatus[],
 ): AnalysisProviderSelection => {
+  const identity = evaluated.profile.provider;
+  const capabilities = evaluated.status.capabilities.map((capability) => ({
+    ...capability,
+    provider: structuredClone(identity),
+  }));
   const selectedStatus = {
     ...evaluated.status,
-    provider: structuredClone(evaluated.profile.provider),
+    provider: structuredClone(identity),
     selected: true,
+    capabilities,
   } satisfies AnalysisProviderCandidateStatus;
   return {
     requestedProviderId,
     binding: {
       provider: evaluated.candidate,
-      identity: structuredClone(evaluated.profile.provider),
+      identity: structuredClone(identity),
       selectionSource: source,
       profile: structuredClone(evaluated.profile),
+      capabilities,
     },
     candidates: replaceCandidate(statuses, selectedStatus),
   };

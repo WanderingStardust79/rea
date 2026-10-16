@@ -8,14 +8,14 @@ import { CLI_COMMANDS } from "../cliCommandNames.js";
 import { logCliCommand } from "../cliLogging.js";
 import type { Logger } from "pino";
 import {
-  directAnalysisOptions,
-  formatSelectionOption,
-  providerSelectionOption,
+  directAnalysisOptionsFromCli,
+  nativeOpenOptionFields,
 } from "./options.js";
 import type { CliInstance } from "./types.js";
 import { runCliJavaScriptApplicationAnalysis } from "./javascriptApplicationAnalysis.js";
 import { withCommandCancellation } from "./commandCancellation.js";
 import { javascriptApplicationOptions } from "../cliObservationOptions.js";
+import { AnalysisInputError } from "../domain/analysisErrorCore.js";
 
 /** Register provider-neutral binary overview and procedure CLI commands. */
 export const registerCoreBinaryCommands = (
@@ -43,16 +43,37 @@ const registerOverviewCommands = (
       .min(1)
       .optional()
       .describe("Load and update a local analysis snapshot"),
-    "target-format": formatSelectionOption,
-    provider: providerSelectionOption,
+    ...nativeOpenOptionFields,
   });
+  // `analyze` declares the JavaScript integrity policy for its JavaScript
+  // lane. Preserve whether the caller supplied it until the target lane is
+  // known, then apply the JavaScript default only in that lane. The owner
+  // field fills an omission with that default, and an `.optional()` wrapper
+  // keeps reporting it, so every binary target would look like an explicit
+  // policy. Remove the owner's default before making the CLI option optional;
+  // reapply its metadata so help and `--schema` keep describing the option.
+  const ownerIntegrityPolicy =
+    javascriptApplicationOptions.shape.integrityPolicy;
+  const defaultIntegrityPolicy = ownerIntegrityPolicy.parse(undefined);
+  const policyMetadata = ownerIntegrityPolicy.meta();
+  const omittableIntegrityPolicy = ownerIntegrityPolicy
+    .removeDefault()
+    .optional();
+  const laneIntegrityPolicy =
+    policyMetadata === undefined
+      ? omittableIntegrityPolicy
+      : omittableIntegrityPolicy.meta(policyMetadata);
   cli.command(CLI_COMMANDS.analyze, {
     description: "Get an overview of an app",
     args: z.object({
-      path: z.string().describe("App, program, or analysis database path"),
+      path: z
+        .string()
+        .min(1)
+        .describe("App, program, or analysis database path"),
     }),
     options: overviewOptions.extend({
-      integrityPolicy: javascriptApplicationOptions.shape.integrityPolicy,
+      integrityPolicy: laneIntegrityPolicy,
+      sourcePath: javascriptApplicationOptions.shape.sourcePath,
     }),
     run: async ({ args, options }) => {
       // Route JavaScript targets exactly like analyze-javascript-application,
@@ -64,25 +85,50 @@ const registerOverviewCommands = (
             runCliJavaScriptApplicationAnalysis(
               {
                 input_path: resolve(args.path),
-                integrity_policy: options.integrityPolicy,
+                integrity_policy:
+                  options.integrityPolicy ?? defaultIntegrityPolicy,
+                ...(options.sourcePath === undefined
+                  ? {}
+                  : { source_paths: options.sourcePath }),
               },
               signal,
             ),
           ),
         );
-      return logCliCommand(logger, "analyze", () =>
-        runDirectAnalysis(
+      return logCliCommand(logger, "analyze", () => {
+        if (options.sourcePath !== undefined)
+          throw new AnalysisInputError(
+            "analyze_javascript_application",
+            undefined,
+            [
+              {
+                path: ["source_paths"],
+                reason: "invalid_value",
+                message:
+                  "Source selection requires the static JavaScript ASAR/directory analysis lane.",
+              },
+            ],
+          );
+        if (options.integrityPolicy !== undefined)
+          throw new AnalysisInputError(
+            "analyze_javascript_application",
+            undefined,
+            [
+              {
+                path: ["integrity_policy"],
+                reason: "invalid_value",
+                message:
+                  "An integrity policy requires the static JavaScript ASAR/directory analysis lane; binary_overview accepts no input.",
+              },
+            ],
+          );
+        return runDirectAnalysis(
           args.path,
           "binary_overview",
           {},
-          directAnalysisOptions(
-            logger,
-            options.snapshot,
-            options.provider,
-            options["target-format"],
-          ),
-        ),
-      );
+          directAnalysisOptionsFromCli(logger, options),
+        );
+      });
     },
   });
   cli.command(CLI_COMMANDS.inspect, {
@@ -97,12 +143,7 @@ const registerOverviewCommands = (
           args.path,
           "binary_overview",
           {},
-          directAnalysisOptions(
-            logger,
-            options.snapshot,
-            options.provider,
-            options["target-format"],
-          ),
+          directAnalysisOptionsFromCli(logger, options),
         ),
       ),
   });
@@ -131,13 +172,19 @@ const registerDecompileCommand = (
         .describe(
           "Procedure name or address; use --procedure=<value> for leading dashes",
         ),
+      "file-offset": z
+        .string()
+        .regex(/^0x[0-9a-fA-F]+$/u)
+        .optional()
+        .describe(
+          "Ghidra source-file byte offset; mapped internally to an analysis address",
+        ),
       snapshot: z
         .string()
         .min(1)
         .optional()
         .describe("Load and update a local analysis snapshot"),
-      "target-format": formatSelectionOption,
-      provider: providerSelectionOption,
+      ...nativeOpenOptionFields,
     }),
     run: ({ args, options }) =>
       logCliCommand(logger, "decompile", () =>
@@ -147,17 +194,21 @@ const registerDecompileCommand = (
           {
             procedure: resolveCliAnalysisSelector(
               args.address,
-              options.procedure,
-              "procedure",
+              options["file-offset"] === undefined
+                ? options.procedure
+                : resolveCliAnalysisSelector(
+                    options.procedure,
+                    `file-offset:${options["file-offset"]}`,
+                    "file-offset",
+                    "procedure_pseudo_code",
+                  ),
+              options["file-offset"] === undefined
+                ? "procedure"
+                : "file-offset",
               "procedure_pseudo_code",
             ),
           },
-          directAnalysisOptions(
-            logger,
-            options.snapshot,
-            options.provider,
-            options["target-format"],
-          ),
+          directAnalysisOptionsFromCli(logger, options),
         ),
       ),
   });
@@ -168,13 +219,17 @@ const routesToJavaScriptAnalysis = async (
   path: string,
   options: {
     readonly snapshot?: string | undefined;
-    readonly "target-format"?: "dos-com" | undefined;
+    readonly "target-format"?: "dos-com" | "raw-binary" | undefined;
+    readonly architecture?: string | undefined;
+    readonly "entry-point"?: string | undefined;
     readonly provider?: string | undefined;
   },
 ): Promise<boolean> =>
   options.provider === undefined &&
   options.snapshot === undefined &&
   options["target-format"] === undefined &&
+  options.architecture === undefined &&
+  options["entry-point"] === undefined &&
   (await isJavaScriptApplicationPath(path));
 
 const isJavaScriptApplicationPath = async (path: string): Promise<boolean> => {
@@ -215,8 +270,7 @@ const registerXrefsCommand = (
         .min(1)
         .optional()
         .describe("Load and update a local analysis snapshot"),
-      "target-format": formatSelectionOption,
-      provider: providerSelectionOption,
+      ...nativeOpenOptionFields,
     }),
     run: ({ args, options }) =>
       logCliCommand(logger, "xrefs", () =>
@@ -231,12 +285,7 @@ const registerXrefsCommand = (
               "xrefs",
             ),
           },
-          directAnalysisOptions(
-            logger,
-            options.snapshot,
-            options.provider,
-            options["target-format"],
-          ),
+          directAnalysisOptionsFromCli(logger, options),
         ),
       ),
   });
@@ -270,8 +319,7 @@ const registerTraceCommand = (
         .min(1)
         .optional()
         .describe("Load and update a local analysis snapshot"),
-      "target-format": formatSelectionOption,
-      provider: providerSelectionOption,
+      ...nativeOpenOptionFields,
     }),
     run: ({ args, options }) =>
       logCliCommand(logger, "trace", () =>
@@ -287,12 +335,7 @@ const registerTraceCommand = (
             ),
             case_sensitive: options.caseSensitive,
           },
-          directAnalysisOptions(
-            logger,
-            options.snapshot,
-            options.provider,
-            options["target-format"],
-          ),
+          directAnalysisOptionsFromCli(logger, options),
         ),
       ),
   });
@@ -326,8 +369,7 @@ const registerFunctionCommand = (
         .min(1)
         .optional()
         .describe("Load and update a local analysis snapshot"),
-      "target-format": formatSelectionOption,
-      provider: providerSelectionOption,
+      ...nativeOpenOptionFields,
     }),
     run: ({ args, options }) =>
       logCliCommand(logger, "function", () =>
@@ -342,12 +384,7 @@ const registerFunctionCommand = (
               "analyze_function",
             ),
           },
-          directAnalysisOptions(
-            logger,
-            options.snapshot,
-            options.provider,
-            options["target-format"],
-          ),
+          directAnalysisOptionsFromCli(logger, options),
         ),
       ),
   });
@@ -381,8 +418,7 @@ const registerInstructionsCommand = (
         .min(1)
         .optional()
         .describe("Load and update a local analysis snapshot"),
-      "target-format": formatSelectionOption,
-      provider: providerSelectionOption,
+      ...nativeOpenOptionFields,
     }),
     run: ({ args, options }) =>
       logCliCommand(logger, CLI_COMMANDS.instructions, () =>
@@ -397,12 +433,7 @@ const registerInstructionsCommand = (
               "read_function_instructions",
             ),
           },
-          directAnalysisOptions(
-            logger,
-            options.snapshot,
-            options.provider,
-            options["target-format"],
-          ),
+          directAnalysisOptionsFromCli(logger, options),
         ),
       ),
   });
@@ -448,8 +479,7 @@ const registerSearchCommand = (
         .min(1)
         .optional()
         .describe("Load and update a local analysis snapshot"),
-      "target-format": formatSelectionOption,
-      provider: providerSelectionOption,
+      ...nativeOpenOptionFields,
     }),
     run: ({ args, options }) =>
       logCliCommand(logger, "search", () =>
@@ -468,12 +498,7 @@ const registerSearchCommand = (
             mode: options.mode,
             case_sensitive: options.caseSensitive,
           },
-          directAnalysisOptions(
-            logger,
-            options.snapshot,
-            options.provider,
-            options["target-format"],
-          ),
+          directAnalysisOptionsFromCli(logger, options),
         ),
       ),
   });
